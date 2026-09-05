@@ -1,0 +1,20 @@
+# Secrets and local config
+agora_token.txt
+agora_telegram.json
+
+# Saved conversations and run output
+agora_sessions/
+agora_runs/
+agora_*.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
