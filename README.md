@@ -59,10 +59,11 @@ Each row offers only what it needs:
 
 - **Install**, when the CLI is missing. Claude Code and Codex use their vendors' own installers; the rest use npm into `agora_tools` beside the script, so nothing needs an administrator and nothing already on the machine is touched. The installer's output streams under the row. If Node.js is missing for an npm install, the row links to nodejs.org instead. Agora never reinstalls or updates a CLI that is already there.
 - **Sign in**, which opens a real terminal window with that CLI's own sign-in already running, the way you would run it yourself. The browser opens from there. Agora then asks the CLI every fifteen seconds for ten minutes and turns the row green by itself.
-- **API key**, for the CLIs that take one. It is masked, it sets that vendor's environment variable for the CLIs Agora starts, it lives in memory for this run only, and it is never written to disk. Codex has no key field on purpose: Agora drives Codex through the ChatGPT subscription sign-in.
 - **Already installed?**, for pasting the full path when a CLI exists but is not on `PATH`.
 
 Nothing is offered when a CLI is connected.
+
+Agora connects a CLI one way only: that CLI's own sign-in. There is no API key field anywhere, Agora holds no key, and it passes no key to the CLIs it starts. A token already in this machine's environment, such as `GH_TOKEN` for Copilot CLI or `GEMINI_API_KEY` for Gemini CLI, is read but never written: those CLIs use such a token ahead of any saved sign-in, so the row says so rather than reporting a state the CLI will not use.
 
 Connection state appears in exactly one other place: pressing Start with a seat whose CLI is not connected does not start the conversation and puts a single line under the header naming the CLI, with a link into Connections.
 
