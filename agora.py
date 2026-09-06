@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # pick the folder you want the agents to read in Setup
-BUILD = "2026-09-06.6"
+BUILD = "2026-09-06.7"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
@@ -633,11 +633,101 @@ def tg_config() -> dict:
 
 
 def _tg_call(token: str, method: str, payload: dict | None = None) -> dict:
-    import urllib.request
+    """One Bot API call. Telegram answers 4xx with a JSON body that explains why; return that instead of raising."""
+    import urllib.error, urllib.request
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}",
                                  data=json.dumps(payload or {}).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try: return json.loads(e.read().decode())
+        except Exception: return {"ok": False, "description": f"HTTP {e.code}"}
+
+
+def tg_state() -> dict:
+    """What the dashboard needs to know about the Telegram link. The token itself never goes to the browser."""
+    c = tg_config(); tok = (c.get("token") or "").strip(); chat = str(c.get("chat_id") or "").strip()
+    return {"tg_ready": bool(tok and chat), "tg_has_token": bool(tok), "tg_chat": chat,
+            "tg_notify": bool(c.get("notify_on_finish", True)), "tg_bot": c.get("bot", "")}
+
+
+def _tg_token(given: str) -> str:
+    """The token typed in the wizard, or the saved one when the box was left empty."""
+    return (given or "").strip() or (tg_config().get("token") or "").strip()
+
+
+def tg_check(token: str) -> dict:
+    """Step 1: is this a real bot token? Asks Telegram for the bot's name."""
+    tok = _tg_token(token)
+    if not tok: return {"ok": False, "error": "Paste the token BotFather gave you first."}
+    if ":" not in tok or len(tok) < 30: return {"ok": False, "error": "That does not look like a bot token. It has digits, a colon, then about 35 letters and digits."}
+    try: r = _tg_call(tok, "getMe")
+    except Exception as exc: return {"ok": False, "error": f"Could not reach Telegram: {type(exc).__name__}"}   # noqa: BLE001
+    if not r.get("ok"): return {"ok": False, "error": "Telegram rejected that token" + (f": {r.get('description')}" if r.get("description") else ".") + " Copy it again from BotFather; a missing character is the usual cause."}
+    b = r.get("result", {})
+    return {"ok": True, "bot": b.get("username", ""), "name": b.get("first_name", "")}
+
+
+def tg_find(token: str) -> dict:
+    """Step 2: who has messaged the bot? One getUpdates call, no polling. If another program is reading this bot
+    Telegram answers 409, and the wizard falls back to the manual way."""
+    tok = _tg_token(token)
+    if not tok: return {"ok": False, "error": "Do step 1 first."}
+    try: r = _tg_call(tok, "getUpdates", {"timeout": 0, "limit": 100, "allowed_updates": ["message"]})
+    except Exception as exc: return {"ok": False, "error": f"Could not reach Telegram: {type(exc).__name__}"}   # noqa: BLE001
+    if not r.get("ok"):
+        d = r.get("description") or ""
+        if "409" in d or "Conflict" in d or "terminated by other" in d or "webhook" in d.lower():
+            return {"ok": False, "conflict": True, "error": "Another program is already reading this bot (or it has a webhook), so Agora cannot look. Use the manual way below."}
+        return {"ok": False, "error": f"Telegram said: {d or 'unknown error'}"}
+    chats: dict[str, dict] = {}
+    for u in r.get("result", []):
+        m = u.get("message") or u.get("edited_message") or {}
+        c = m.get("chat") or {}
+        if not c.get("id"): continue
+        name = c.get("title") or " ".join(x for x in (c.get("first_name"), c.get("last_name")) if x) or c.get("username") or str(c["id"])
+        k = str(c["id"])
+        if k not in chats or len(name) > len(chats[k]["name"]): chats[k] = {"id": k, "name": name, "kind": c.get("type", "")}
+    return {"ok": True, "chats": list(chats.values())}
+
+
+def tg_test(token: str, chat_id: str) -> dict:
+    tok = _tg_token(token); chat = (chat_id or "").strip()
+    if not tok: return {"ok": False, "error": "Do step 1 first."}
+    if not chat: return {"ok": False, "error": "Agora needs your chat id first (step 2)."}
+    try: r = _tg_call(tok, "sendMessage", {"chat_id": chat, "text": "Agora is connected. You will get a message here when a conversation finishes, and the phone link when you ask for it.", "disable_web_page_preview": True})
+    except Exception as exc: return {"ok": False, "error": f"Could not reach Telegram: {type(exc).__name__}"}   # noqa: BLE001
+    if r.get("ok"): return {"ok": True}
+    d = r.get("description") or "unknown error"
+    hint = " Open a chat with your bot in Telegram and press Start first; a bot cannot message you until you do." if "chat not found" in d.lower() or "blocked" in d.lower() else ""
+    return {"ok": False, "error": f"Telegram said: {d}.{hint}"}
+
+
+def tg_save(token: str, chat_id: str, notify: bool, bot: str = "") -> dict:
+    tok = _tg_token(token); chat = (chat_id or "").strip()
+    if not tok or not chat: return {"ok": False, "error": "A checked token and a chat id are both needed before saving."}
+    cfg = tg_config(); cfg.update({"token": tok, "chat_id": chat, "notify_on_finish": bool(notify)})
+    if bot: cfg["bot"] = bot
+    TG_FILE.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    return {"ok": True}
+
+
+def tg_fill_bot() -> None:
+    """A config written by hand has no bot name; look it up once in the background so Settings can show it."""
+    c = tg_config()
+    if not (c.get("token") or "").strip() or c.get("bot"): return
+    def work() -> None:
+        r = tg_check("")
+        if r.get("ok") and r.get("bot"):
+            c2 = tg_config(); c2["bot"] = r["bot"]; TG_FILE.write_text(json.dumps(c2, indent=1), encoding="utf-8")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def tg_clear() -> dict:
+    """Disconnect: forget the bot and chat. The bot itself still exists in Telegram; delete it with BotFather if you want."""
+    TG_FILE.write_text(json.dumps({"token": "", "chat_id": "", "notify_on_finish": True}, indent=1), encoding="utf-8")
+    return {"ok": True}
 
 
 def tg_send(text: str) -> str:
@@ -1169,7 +1259,7 @@ class Agora:
         first = self._open_latest()
         self.sid = first.id; self.runs[first.id] = Run(first, self)
         self.phone_url = ""; self.away_url = ""; self.last_tg = ""
-        refresh_versions()
+        refresh_versions(); tg_fill_bot()
 
     def _open_latest(self) -> Session:
         for meta in list_sessions():
@@ -1208,7 +1298,7 @@ class Agora:
                     "rounds_done": s.rounds_done, "sessions": list_sessions(), "live": live,
                     "terms": tstates,
                     "phone_url": self.phone_url, "away_url": self.away_url, "last_tg": self.last_tg,
-                    "tg_ready": bool((tg_config().get("token") or "").strip()),
+                    **tg_state(),
                     "templates": list(TEMPLATES.keys()), "user_templates": list(user_templates().keys()), "sessions_dir": str(SESSIONS), "build": BUILD,
                     "providers": self._providers()}
 
@@ -1428,6 +1518,7 @@ textarea{line-height:1.55}
 .vers{display:flex;flex-direction:column;gap:4px}
 .clisum{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px}.clisum .ok{color:#34D399}.clisum .off{color:var(--danger)}
 .cli{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:8px;font-size:13px}.cli .st{font-weight:600;white-space:nowrap}.cli.ok .st{color:#34D399}.cli.off .st{color:var(--danger)}
+#tgwiz code{font:12px ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px}#tgwiz ol{padding-left:18px;margin:6px 0 10px}#tgwiz li{margin:4px 0}#tgwiz a{color:var(--accent)}#tgwiz .sg.done h2::after{content:" \2713";color:#34D399}
 .cli code{font:12px ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;word-break:break-all}.cli .note{margin-top:6px}
 .sheetwrap .panel{width:min(520px,100%);background:var(--s1);border-left:1px solid var(--line);overflow:auto;padding:22px 24px}
 .sheetwrap .panel h1{font-size:16px;margin:0 0 12px;display:flex;justify-content:space-between;align-items:center}
@@ -1512,7 +1603,8 @@ textarea{line-height:1.55}
  <section class="sg"><h2>Phone</h2><div class="note">Open Agora on your phone. The Tailscale link works anywhere; the home link only on your wifi.</div>
   <div class="kv"><span>Anywhere</span><code id="awayUrl">not available</code><button class="btn sm cp" data-for="awayUrl">Copy</button></div>
   <div class="kv"><span>Home wifi</span><code id="homeUrl">not available</code><button class="btn sm cp" data-for="homeUrl">Copy</button></div>
-  <div class="row" style="margin-top:8px"><button id="tg" class="btn">Send link to my Telegram</button><span class="note" id="tgState"></span></div></section>
+  <div class="row" style="margin-top:8px"><button id="tg" class="btn">Connect Telegram</button><button id="tgChange" class="btn sm" style="display:none">Change</button><button id="tgOff" class="btn sm" style="display:none">Disconnect</button><span class="note" id="tgState"></span></div>
+  <div class="note" id="tgInfo" style="margin-top:6px"></div></section>
  <section class="sg"><h2>CLIs</h2><div class="note">Agora talks to each agent by running its CLI, the same command you type in a terminal, inside the folder you pick. Install a CLI, log in to it once in a terminal, and Agora can seat it. Agora never installs, updates, or logs in for you. If a CLI is installed but Agora cannot find it, paste the full path to its executable and press Save.</div>
   <div id="clis"></div>
   <div class="row" style="margin-top:10px"><button id="cliCheck" class="btn sm">Check again</button><span class="note" id="cliState"></span></div></section>
@@ -1524,6 +1616,20 @@ textarea{line-height:1.55}
   <div class="kv"><span>Build</span><code id="buildTag"></code></div>
   <div class="kv"><span>Conversations folder</span><code id="sessDir"></code></div>
   <div class="row" style="margin-top:10px"><button id="quit" class="danger solid">Quit Agora</button><span class="note">Kills every CLI Agora started and closes the server. Conversations are kept.</span></div></section>
+</div></div>
+<div id="tgwiz" class="sheetwrap"><div class="panel"><h1>Connect Telegram <button class="icon" id="tgwizClose" aria-label="Close">&#10005;</button></h1>
+ <div class="note">Agora can message you when a conversation finishes and send you the phone link. It does this through a Telegram bot that you own. The bot token is kept in <code>agora_telegram.json</code> next to Agora and is only ever sent to Telegram. Three short steps, about three minutes.</div>
+ <section class="sg"><h2 id="tgH1">Step 1 of 3: create a bot</h2>
+  <ol class="note"><li>Open Telegram (phone or PC) and search for <b>@BotFather</b>, the one with the blue check.</li><li>Send it <code>/newbot</code>. It asks for a display name (anything, for example <i>Agora</i>) and then a username, which must end in <code>bot</code> (for example <i>agora_yourname_bot</i>).</li><li>BotFather replies with a token that looks like <code>123456789:AAH8f...</code>. Copy the whole thing and paste it here.</li></ol>
+  <div class="row"><input id="tgTok" placeholder="Paste the bot token" style="flex:1" autocomplete="off"><button class="btn" id="tgCheck">Check</button></div><div class="note" id="tgS1" style="margin-top:6px"></div></section>
+ <section class="sg" id="tgStep2"><h2 id="tgH2">Step 2 of 3: tell the bot who you are</h2>
+  <ol class="note"><li>Open a chat with your new bot: <a id="tgBotLink" href="#" target="_blank" rel="noopener">its link appears here after step 1</a>, or search its username in Telegram.</li><li>Press <b>Start</b>, then send it any message, for example <code>hi</code>. A bot cannot message you until you do this.</li><li>Come back here and press Find my chat.</li></ol>
+  <div class="row"><button class="btn" id="tgFind">Find my chat</button><span class="note" id="tgS2"></span></div><div id="tgPick" class="row" style="margin-top:6px;flex-wrap:wrap"></div>
+  <div class="note" style="margin-top:10px">If Find my chat cannot see your message (another program may already be reading this bot), message <b>@userinfobot</b> in Telegram. It replies with your id. Paste it here:</div>
+  <div class="row" style="margin-top:6px"><input id="tgChat" placeholder="Your chat id, digits only" style="flex:1" inputmode="numeric"></div></section>
+ <section class="sg" id="tgStep3"><h2 id="tgH3">Step 3 of 3: test and save</h2>
+  <label class="check"><input id="tgNotify" type="checkbox" checked><span>Message me when a conversation finishes</span></label>
+  <div class="row" style="margin-top:10px"><button class="btn" id="tgTest">Send a test message</button><button class="primary" id="tgSave">Save</button><span class="note" id="tgS3"></span></div></section>
 </div></div>
 <div id="sheet" class="sheetwrap"><div class="panel"><h1>Details <button class="icon" id="sheetClose" aria-label="Close details">&#10005;</button></h1><div id="sheetBody"></div>
  <div style="position:sticky;bottom:0;background:var(--s1);padding:12px 0 8px;border-top:1px solid var(--line);margin-top:16px"><button id="sheetSave" class="primary">Save changes</button><div class="note" id="saveState" style="margin-top:8px">Changes save automatically when you leave a field.</div></div></div></div>
@@ -1623,7 +1729,7 @@ function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeT
  if($('tmpl').innerHTML!==topts){const cur=$('tmpl').value;$('tmpl').innerHTML=topts;$('tmpl').value=cur}$('tmpl').disabled=started||busy;$('tmplApply').disabled=started||busy;$('tmplDel').style.display=ut.includes($('tmpl').value)?'':'none';
  if(first||!editing){$('title').value=s.title;$('repo').value=s.repo;$('topic').value=s.topic;$('extra').value=s.extra;$('rounds').value=s.rounds;$('maxMsgs').value=s.max_messages||'';$('maxMins').value=s.max_minutes||'';$('ro').checked=s.readonly;
   if(first||seatsLocked!==started||JSON.stringify(seatsFromDom())!==JSON.stringify(s.seats.map(x=>({name:x.name,provider:x.provider,model:x.model,stance:x.stance,color:x.color})))){renderSeats(s.seats,started);seatsLocked=started}}
- renderClis(s);
+ renderClis(s);if($('settings').classList.contains('open'))renderTg(s);
  renderHist(s);
  // empty-state setup vs conversation
  if(!mobile()){$('setup').style.display=started||busy?'none':'block';$('chat').style.display=started||busy?'block':'none';$('composer').style.display=started||busy?'':'none';document.body.classList.toggle('autoterm',!(started||busy))}
@@ -1639,7 +1745,7 @@ function showTab(t){if(t==='settings'){openSettings();document.querySelectorAll(
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.t));if(mobile())showTab('chat');
 $('railBtn').onclick=()=>document.body.classList.toggle('norail');$('termBtn').onclick=()=>{document.body.classList.toggle('noterm')};
 $('gearBtn').onclick=()=>openSettings();$('settingsClose').onclick=()=>{$('settings').classList.remove('open');if(mobile())showTab('chat')};
-function openSettings(){if(S){$('awayUrl').textContent=S.away_url||'not available (install Tailscale on this PC and your phone)';$('homeUrl').textContent=S.phone_url||'not available';$('sessDir').textContent=S.sessions_dir||'';$('buildTag').textContent=S.build||''}$('settings').classList.add('open')}
+function openSettings(){if(S){renderTg(S);$('awayUrl').textContent=S.away_url||'not available (install Tailscale on this PC and your phone)';$('homeUrl').textContent=S.phone_url||'not available';$('sessDir').textContent=S.sessions_dir||'';$('buildTag').textContent=S.build||''}$('settings').classList.add('open')}
 document.querySelectorAll('.cp').forEach(b=>b.onclick=async()=>{const t=$(b.dataset.for).textContent;if(!t.startsWith('http'))return;try{await navigator.clipboard.writeText(t);b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1200)}catch(e){prompt('Copy this link',t)}});
 $('menuBtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open')};function closeMenu(){$('menu').classList.remove('open')}document.addEventListener('click',e=>{if(!$('menu').contains(e.target))closeMenu()});
 // details sheet: move the setup form in and out
@@ -1681,7 +1787,30 @@ $('sayText').onkeydown=e=>{const open=$('ac').classList.contains('open');
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('sayBtn').click()}};
 $('cliOpen').onclick=()=>openSettings();
 $('cliCheck').onclick=async()=>{$('cliState').textContent='Checking...';render(await api('/clis/refresh',{}));$('cliState').textContent='Checked '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})};
-$('tg').onclick=async()=>{$('tgState').textContent='Sending...';const r=await api('/telegram',{});$('tgState').textContent=r.last_tg||'No response'};
+// telegram: the button sends the phone link once connected; before that (or after Disconnect) it opens the setup wizard
+function renderTg(s){const ready=!!s.tg_ready;$('tg').textContent=ready?'Send link to my Telegram':'Connect Telegram';$('tgChange').style.display=ready?'':'none';$('tgOff').style.display=ready?'':'none';
+ $('tgInfo').textContent=ready?`Connected${s.tg_bot?' to @'+s.tg_bot:''}, chat ${s.tg_chat}. ${s.tg_notify?'Agora messages you when a conversation finishes.':'Finish notifications are off.'}`:'Not connected. Agora can message you when a conversation finishes and send you the phone link. Press Connect Telegram for a three-step setup.'}
+let tgBot='';
+function tgOpen(){const s=S||{};tgBot=s.tg_bot||'';$('tgTok').value='';$('tgTok').placeholder=s.tg_has_token?'A token is saved. Paste a new one only to replace it.':'Paste the bot token';
+ $('tgS1').textContent=s.tg_has_token?('Using the saved token'+(s.tg_bot?' for @'+s.tg_bot:'')+'.'):'';$('tgBotLink').textContent=s.tg_bot?'t.me/'+s.tg_bot:'its link appears here after step 1';$('tgBotLink').href=s.tg_bot?'https://t.me/'+s.tg_bot:'#';
+ $('tgChat').value=s.tg_chat||'';$('tgNotify').checked=s.tg_notify!==false;$('tgS2').textContent='';$('tgS3').textContent='';$('tgPick').innerHTML='';
+ document.querySelectorAll('#tgwiz .sg').forEach(x=>x.classList.remove('done'));if(s.tg_has_token)$('tgH1').parentElement.classList.add('done');if(s.tg_chat)$('tgH2').parentElement.classList.add('done');
+ $('tgwiz').classList.add('open')}
+$('tgwizClose').onclick=()=>$('tgwiz').classList.remove('open');
+$('tg').onclick=async()=>{if(!(S&&S.tg_ready)){tgOpen();return}$('tgState').textContent='Sending...';const r=await api('/telegram',{});render(r);$('tgState').textContent=r.last_tg||'No response'};
+$('tgChange').onclick=tgOpen;
+$('tgOff').onclick=async()=>{if(!confirm('Disconnect Telegram? Agora forgets the bot token and chat id. The bot itself stays in Telegram; delete it with BotFather if you want.'))return;await api('/telegram/clear',{});$('tgState').textContent='Disconnected.';render(await api('/state?since=1000000000&terms=0'))};
+$('tgCheck').onclick=async()=>{$('tgS1').textContent='Asking Telegram...';const r=await api('/telegram/check',{token:$('tgTok').value});
+ if(r.ok){tgBot=r.bot;$('tgS1').textContent=`Found your bot: ${r.name} (@${r.bot}).`;$('tgBotLink').textContent='t.me/'+r.bot;$('tgBotLink').href='https://t.me/'+r.bot;$('tgH1').parentElement.classList.add('done')}else{$('tgS1').textContent=r.error;$('tgH1').parentElement.classList.remove('done')}};
+$('tgFind').onclick=async()=>{$('tgS2').textContent='Looking...';$('tgPick').innerHTML='';const r=await api('/telegram/find',{token:$('tgTok').value});
+ if(!r.ok){$('tgS2').textContent=r.error;return}
+ if(!r.chats.length){$('tgS2').textContent='No message from you yet. Open the bot, press Start, send it "hi", wait a few seconds, then press Find my chat again.';return}
+ if(r.chats.length===1){$('tgChat').value=r.chats[0].id;$('tgS2').textContent=`Found you: ${r.chats[0].name} (id ${r.chats[0].id}).`;$('tgH2').parentElement.classList.add('done');return}
+ $('tgS2').textContent='Several chats have messaged this bot. Pick yours:';$('tgPick').innerHTML=r.chats.map(c=>`<button class="btn sm" data-id="${esc(c.id)}">${esc(c.name)} · ${esc(c.id)}</button>`).join('');
+ document.querySelectorAll('#tgPick button').forEach(b=>b.onclick=()=>{$('tgChat').value=b.dataset.id;$('tgS2').textContent='Using chat '+b.dataset.id+'.';$('tgH2').parentElement.classList.add('done')})};
+$('tgTest').onclick=async()=>{$('tgS3').textContent='Sending...';const r=await api('/telegram/test',{token:$('tgTok').value,chat_id:$('tgChat').value});$('tgS3').textContent=r.ok?'Sent. Check Telegram, then press Save.':r.error};
+$('tgSave').onclick=async()=>{const r=await api('/telegram/save',{token:$('tgTok').value,chat_id:$('tgChat').value,notify:$('tgNotify').checked,bot:tgBot});
+ if(!r.ok){$('tgS3').textContent=r.error;return}$('tgwiz').classList.remove('open');$('tgState').textContent='Connected. Press Send link to my Telegram to get the phone link.';render(await api('/state?since=1000000000&terms=0'))};
 let saveTimer=null;['title','repo','topic','extra','rounds','maxMsgs','maxMins'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
 $('ro').onchange=save;$('referee').onchange=async()=>render(await api('/config',{referee:$('referee').value}));$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
 let pk={path:''};
@@ -1748,6 +1877,12 @@ def make_handler(agora: Agora, token: str):
         def do_POST(self):
             if not self._authed(): return
             n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
+            direct = {"/telegram/check": lambda: tg_check(data.get("token", "")),
+                      "/telegram/find": lambda: tg_find(data.get("token", "")),
+                      "/telegram/test": lambda: tg_test(data.get("token", ""), data.get("chat_id", "")),
+                      "/telegram/save": lambda: tg_save(data.get("token", ""), data.get("chat_id", ""), bool(data.get("notify", True)), data.get("bot", "")),
+                      "/telegram/clear": tg_clear}
+            if self.path in direct: return self._send(json.dumps(direct[self.path]()).encode(), "application/json")
             {"/config": lambda: agora.configure(data), "/start": agora.start, "/pause": agora.pause,
              "/vote": agora.call_vote, "/stop": agora.stop, "/shutdown": agora.shutdown,
              "/say": lambda: agora.say(data.get("text", ""), data.get("target", "")),

@@ -136,13 +136,15 @@ Access is protected by a token stored in `agora_token.txt` next to the script. I
 
 ## Telegram notifications (optional)
 
-Copy `agora_telegram.example.json` to `agora_telegram.json` and fill in a bot token and your chat id:
+Agora can message you on Telegram when a conversation finishes, and send you the phone link. Open Settings and press **Connect Telegram**; a three-step wizard walks you through it in about three minutes:
 
-```json
-{"token": "123456:ABC...", "chat_id": "123456789", "notify_on_finish": true}
-```
+1. **Create a bot.** In Telegram, message @BotFather, send `/newbot`, pick a name and a username ending in `bot`, and paste the token it gives you into the wizard. Press Check and Agora confirms the bot's name.
+2. **Tell the bot who you are.** Open the chat with your new bot (the wizard links to it), press Start, send it any message, then press Find my chat. If another program is already reading that bot, the wizard says so and you can paste your id from @userinfobot instead.
+3. **Test and save.** Send yourself a test message, choose whether to be notified when conversations finish, and press Save.
 
-Message `@userinfobot` on Telegram to get your chat id. Agora will send you a message when a conversation finishes, and the Settings panel can send the phone link to you.
+The wizard opens whenever you press the Telegram button while nothing is connected, including after you press Disconnect or blank the file. Once connected the same button sends the phone link, and Change reopens the wizard.
+
+Everything is stored in `agora_telegram.json` next to the script (the file `agora_telegram.example.json` shows the shape). The token is only ever sent to Telegram and never to the browser. Agora deliberately does not poll the bot for updates, so a bot you already use with another program keeps working.
 
 ## Codex notes
 
