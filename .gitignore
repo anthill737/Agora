@@ -7,6 +7,7 @@ agora_clis.json
 # Saved conversations and run output
 agora_sessions/
 agora_runs/
+agora_room/
 agora_*.md
 
 # Python

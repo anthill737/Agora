@@ -28,7 +28,7 @@ python agora.py
 
 It opens `http://127.0.0.1:8765/?token=...` in your browser. Then:
 
-1. Pick the folder the agents will sit in.
+1. Decide where the agents sit. The default is **Nowhere in particular**: an empty folder Agora keeps for itself, always read-only, right for most councils and for every game. Choose **A folder I choose** when the conversation is about code the agents should read.
 2. Add seats, or start from a template. Each seat has a name, a provider, a model, an optional stance ("Skeptic", "Defender", a character sheet), and a color.
 3. Write the topic (the charge) and any extra instructions.
 4. Choose Council or Game, how they speak, and how many rounds or what limits.
@@ -79,7 +79,9 @@ Flags:
 - *Take turns.* Agents speak one after another in seat order. Each round every agent speaks once, then everyone gives a ranked closing statement. You can add more rounds afterwards with Continue.
 - *Open floor.* No turns. Every message goes to everyone at once and each agent either replies or answers `PASS`. Use `@Name` in a message to demand an answer from someone. The floor closes when everyone passes on the latest message, when a message or time limit you set is reached, or when you press End. Closing statements follow.
 
-**Game framing.** Switching a draft conversation from Council to Game makes it playable without further setup: Agora seats the World as referee if there is none, gives every character without a stance a stat block, seats four characters if none had one, sets the arena topic if the topic was still the default, and switches to six rounds of turns. Everything it added is editable. Switching back to Council removes the World and the characters Agora seated, blanks borrowed stat blocks, and restores the topic. Seats you named or wrote a stance for are kept in both directions.
+**Where the agents sit.** Every CLI needs a working folder, so "nowhere in particular" is really an empty, disposable folder named `agora_room` next to the script. Agora creates it on demand, recreates it if you delete it, and marks it trusted for Codex once. Conversations in the room are read-only with no full-access option: there is nothing there to write, and the only thing full access could do is let an agent reach the rest of the disk. The council prompt drops its "read this folder and cite files" lines in the room. Templates and saved conversations remember the choice.
+
+**Game framing.** Switching a draft conversation from Council to Game makes it playable without further setup: Agora seats the World as referee if there is none, gives every character without a stance a stat block, seats four characters if none had one, sets the arena topic if the topic was still the default, moves the game into the room, and switches to six rounds of turns. Everything it added is editable. Switching back to Council removes the World and the characters Agora seated, blanks borrowed stat blocks, and restores the topic. Seats you named or wrote a stance for are kept in both directions.
 
 **You are the convener.** You can interject at any time from the dashboard, to everyone or to one agent. Agents are told to address what you said before anything else.
 
@@ -154,7 +156,7 @@ Codex refuses to run non-interactively in a folder it has not been told to trust
 
 A few defaults live at the top of `agora.py`:
 
-- `DEFAULT_REPO`: the folder new conversations start in. Change it to your own project, or just pick a folder in the dashboard.
+- `DEFAULT_REPO`: the folder offered when a conversation picks "A folder I choose". New conversations start in the room instead.
 - `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here. Any seat can also use a custom model name typed in the UI. A provider with `"gate": True` starts one process at a time.
 - `TURN_TIMEOUT`: how long one agent may take per turn, in seconds.
 - `FRAMING`, `OPENING`, `REPLY`, `OPEN_*`, `VOTE`: the council prompts.
@@ -163,7 +165,7 @@ A few defaults live at the top of `agora.py`:
 
 ## Files not committed
 
-`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, and all saved conversations and run output. Those stay on your machine.
+`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, the empty room, and all saved conversations and run output. Those stay on your machine.
 
 ## License
 
