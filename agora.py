@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # the folder offered when a conversation chooses "A folder I choose"
-BUILD = "2026-09-06.10"
+BUILD = "2026-09-06.11"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
@@ -114,16 +114,6 @@ PROVIDERS = {
     },
 }
 
-# How to get each CLI, shown under Settings > CLIs. Agora only runs CLIs; it never installs, updates, or logs in to them.
-for _n, _inst, _login in [
-    ("Claude Code", "npm install -g @anthropic-ai/claude-code", "claude   (then type /login)"),
-    ("Codex (latest)", "Install Node.js from nodejs.org; npx comes with it and downloads Codex on first use", "npx -y @openai/codex@latest login"),
-    ("Codex", "npm install -g @openai/codex", "codex login"),
-    ("OpenCode", "npm install -g opencode-ai", "opencode auth login"),
-    ("Copilot CLI", "npm install -g @github/copilot", "copilot login   (or set GH_TOKEN)"),
-    ("Gemini CLI", "npm install -g @google/gemini-cli", "gemini   (then follow the sign-in prompt)"),
-]: PROVIDERS[_n]["install"], PROVIDERS[_n]["login"] = _inst, _login
-
 # ---------------------------------------------------------------- where each CLI lives
 CLI_FILE = HERE.with_name("agora_clis.json")   # {"Claude Code": "C:\\full\\path\\claude.cmd", ...} for CLIs that are not on PATH
 
@@ -171,8 +161,6 @@ def child_env(provider: str) -> dict:
     for k in _NESTED: env.pop(k, None)
     env.setdefault("NO_COLOR", "1")
     if provider == "Claude Code": env.setdefault("DISABLE_AUTOUPDATER", "1")
-    key = SESSION_KEYS.get(provider)
-    if key and KEY_ENV.get(provider): env[KEY_ENV[provider]] = key   # typed in Connections, this run only
     return env
 
 
@@ -676,10 +664,9 @@ def tool_dirs() -> list[Path]:
     return d
 
 
-SESSION_KEYS: dict[str, str] = {}    # provider -> API key typed in Connections. Memory only, never written to disk.
-# Codex is deliberately absent: Agora drives Codex through the ChatGPT subscription sign-in only, because that is
-# the login its token handling below is built around.
-KEY_ENV = {"Claude Code": "ANTHROPIC_API_KEY", "Copilot CLI": "COPILOT_GITHUB_TOKEN", "Gemini CLI": "GEMINI_API_KEY"}
+# Agora connects a CLI one way only: that CLI's own sign-in. It never asks for, holds, or passes an API key.
+# The names below are read, never written: a token already in this machine's environment changes how the CLI
+# behaves, so the row says so rather than reporting a state that is not the one the CLI will use.
 COPILOT_ENV = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[=>()][0-9A-Za-z]?|[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -760,7 +747,7 @@ def probe_opencode(exe: str) -> tuple[str, str]:
 
 def probe_gemini(exe: str) -> tuple[str, str]:
     for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        if os.environ.get(k): return "on", f"Using {k} from the environment."
+        if os.environ.get(k): return "on", f"This machine's environment has {k}, which Gemini CLI uses ahead of any saved sign-in."
     rc, out = _probe([exe, "auth", "status"], 30)
     low = out.lower()
     if rc == 0 and ("authenticated" in low or "signed in" in low or "logged in" in low): return "on", " ".join(out.split())[:140]
@@ -773,9 +760,8 @@ def probe_gemini(exe: str) -> tuple[str, str]:
 def probe_copilot(exe: str) -> tuple[str, str]:
     """Copilot CLI has no sign-in status command and keeps its token in the operating system credential store,
     which Agora cannot read. An environment token is a definite answer; otherwise only a real request can tell."""
-    if SESSION_KEYS.get("Copilot CLI"): return "on", "Using the API key you typed here, this session only."
     for k in COPILOT_ENV:
-        if os.environ.get(k): return "on", f"Using {k} from the environment, which takes precedence over a saved login."
+        if os.environ.get(k): return "on", f"This machine's environment has {k}, which Copilot CLI uses ahead of any saved sign-in."
     t = TESTS.get("Copilot CLI")
     if t and t.get("ok"): return "on", f"Answered a test prompt at {t.get('when', '')}."
     if t and not t.get("ok"): return "off", (t.get("hint") or t.get("text") or "The check failed.")
@@ -805,10 +791,6 @@ def check_conn(name: str, paid: bool = False) -> dict:
             ok, ver = _ver_of([path, "--version"])
             if not ok: ver = ""
         with _ver_lock: VERSIONS.setdefault(name, {})["installed"] = ver
-        if SESSION_KEYS.get(name) and name != "Copilot CLI":
-            _set_conn(name, state="on", version=ver, checked=time.time(),
-                      detail=f"Using the API key you typed here as {KEY_ENV.get(name, 'the key')}, this session only.")
-            return CONN[name]
         if name == "Claude Code": state, detail = probe_claude(path)
         elif name == "Codex": state, detail = probe_codex(path)
         elif name == "Codex (latest)":
@@ -1072,18 +1054,6 @@ def start_install(provider: str) -> dict:
     return {"ok": True}
 
 
-def set_session_key(provider: str, key: str) -> dict:
-    """An API key for this run only: held in memory, given to the CLIs Agora starts, never written to disk."""
-    if provider not in KEY_ENV: return {"ok": False, "error": "That CLI takes no API key."}
-    key = (key or "").strip()
-    targets = [provider]
-    for t in targets:
-        if key: SESSION_KEYS[t] = key
-        else: SESSION_KEYS.pop(t, None)
-    for t in targets: check_conn(t)
-    return {"ok": True, "has_key": bool(key)}
-
-
 def connections() -> dict:
     """Everything the Connections screen shows. No secret ever leaves this process."""
     ov = cli_overrides(); out = {}
@@ -1097,7 +1067,6 @@ def connections() -> dict:
                   "override": ov.get(k, ""), "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
                   "state": state, "detail": c.get("detail", ""), "version": VERSIONS.get(k, {}).get("installed", ""),
                   "latest": VERSIONS.get(k, {}).get("latest", ""), "warnings": env_warnings(k),
-                  "key_env": KEY_ENV.get(k, ""), "has_key": bool(SESSION_KEYS.get(k)),
                   "can_install": path is None and k != "Codex (latest)", "npm": not npm_missing(), "node_url": NODE_URL,
                   "install_note": "Runs the newest Codex through npx; there is nothing to install beyond Node.js." if k == "Codex (latest)" else install_argv(k)[1],
                   "login_cmd": " ".join(login_argv(k)), "waiting": bool(w and w["until"] > time.time()),
@@ -2122,7 +2091,7 @@ textarea{line-height:1.55}
 .crow .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
 .crow pre{margin:10px 0 0;padding:8px 10px;background:#050506;border:1px solid var(--line);border-radius:8px;max-height:190px;overflow:auto;font:11.5px/1.45 ui-monospace,Consolas,monospace;color:var(--mono);white-space:pre-wrap}
 .crow code{font:12px ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;word-break:break-all}
-.keybox,.pathbox{display:none;gap:8px;margin-top:8px}.keybox.open,.pathbox.open{display:flex}
+.pathbox{display:none;gap:8px;margin-top:8px}.pathbox.open{display:flex}
 .btn.sm{height:32px;padding:0 10px;font-size:12.5px}
 #blocker{grid-column:1/4;grid-row:2;display:none;align-items:center;gap:10px;padding:9px 14px;background:#2A1215;border-bottom:1px solid var(--danger);color:#F3B0B3;font-size:13px}
 #blocker.on{display:flex}#blocker .lk{color:var(--accent);background:transparent;border:0;padding:0;height:auto;text-decoration:underline;cursor:pointer;font:inherit}
@@ -2271,9 +2240,6 @@ function connRow(k,p){
   acts+=`<button class="btn sm" data-a="pathbox">Already installed?</button>`;
  }else if(p.state!=='on'){
   acts+=`<button class="btn sm" data-a="login">Sign in</button><button class="btn sm" data-a="check">Check</button>`;
-  if(p.key_env)acts+=`<button class="btn sm" data-a="keybox">API key</button>`;
- }else if(p.has_key){
-  acts+=`<button class="btn sm" data-a="clearkey">Forget the API key</button>`;
  }
  const wait=p.waiting?`<div class="det">Waiting for the sign-in to finish in the terminal window. Agora asks ${esc(k)} every fifteen seconds and turns this row green by itself.</div>`:'';
  const job=p.install?`<pre>${esc((p.install.lines||[]).join('\n'))||'Starting...'}</pre><div class="det">${p.install.done?esc(p.install.note||''):'Installing, this can take a couple of minutes.'}</div>`:'';
@@ -2283,33 +2249,28 @@ function connRow(k,p){
   <div class="top"><span class="dotc"></span><span class="nm">${esc(k)}</span><span class="ver">${ver}</span><span class="stat">${esc(st)}</span></div>
   ${p.detail?`<div class="det">${esc(p.detail)}</div>`:''}${inst}${warns}${wait}
   <div class="acts">${acts}</div>
-  <div class="keybox"><input class="kin" type="password" placeholder="${esc(p.key_env||'API key')}" autocomplete="off"><button class="btn sm" data-a="savekey">Save</button></div>
   <div class="pathbox"><input class="pin" placeholder="Full path to ${esc(p.exe_default)}" value="${esc(p.override||'')}"><button class="btn sm" data-a="savepath">Save</button></div>
   ${job}</div>`}
 function renderConns(s){const P=s.providers||{};
- const sig=JSON.stringify(Object.entries(P).map(([k,p])=>[k,p.state,p.detail,p.version,p.waiting,p.has_key,p.override,p.install&&p.install.lines.length,p.install&&p.install.done]));
+ const sig=JSON.stringify(Object.entries(P).map(([k,p])=>[k,p.state,p.detail,p.version,p.waiting,p.override,p.install&&p.install.lines.length,p.install&&p.install.done]));
  const box=$('conns');
  if(sig!==connSig){
-  const opened=[...box.querySelectorAll('.keybox.open,.pathbox.open')].map(e=>e.parentElement.dataset.k+':'+e.className.split(' ')[0]);
+  const opened=[...box.querySelectorAll('.pathbox.open')].map(e=>e.parentElement.dataset.k+':'+e.className.split(' ')[0]);
   const focus=document.activeElement&&box.contains(document.activeElement)?document.activeElement:null;
   const val=focus?focus.value:null,cls=focus?focus.className:'',row=focus?focus.closest('.crow').dataset.k:'';
   connSig=sig;box.innerHTML=Object.entries(P).map(([k,p])=>connRow(k,p)).join('');
   opened.forEach(o=>{const [k,c]=o.split(':');const r=box.querySelector(`.crow[data-k="${CSS.escape(k)}"] .${c}`);if(r)r.classList.add('open')});
   box.querySelectorAll('.crow').forEach(r=>{const k=r.dataset.k;
    r.querySelectorAll('[data-a]').forEach(b=>b.onclick=()=>connAct(k,b.dataset.a,r));
-   r.querySelector('.kin').onkeydown=e=>{if(e.key==='Enter')connAct(k,'savekey',r)};
    r.querySelector('.pin').onkeydown=e=>{if(e.key==='Enter')connAct(k,'savepath',r)}});
   if(focus&&row){const back=box.querySelector(`.crow[data-k="${CSS.escape(row)}"] .${cls.split(' ')[0]}`);if(back){back.value=val;back.focus()}}
  }}
 async function connAct(k,a,row){const note=t=>$('connState').textContent=t;
- if(a==='keybox'||a==='pathbox'){const el=row.querySelector('.'+a.replace('box','box'));el.classList.toggle('open');if(el.classList.contains('open'))el.querySelector('input').focus();return}
+ if(a==='pathbox'){const el=row.querySelector('.pathbox');el.classList.toggle('open');if(el.classList.contains('open'))el.querySelector('input').focus();return}
  if(a==='install'){note('Installing '+k+'...');const r=await api('/conn/install',{provider:k});if(!r.ok)note(r.error||'It would not start.');else{connSig='';note('')}return}
  if(a==='login'){note('Opening a terminal window...');const r=await api('/conn/login',{provider:k});
   note(r.ok?'A terminal window is open with: '+r.cmd+'. Finish the sign-in there; this row turns green by itself.':(r.error||'It would not open.'));connSig='';return}
  if(a==='check'){note('Checking '+k+'...');const paid=k==='Copilot CLI';await api('/conn/check',{provider:k,paid:paid});connSig='';note('');return}
- if(a==='savekey'){const v=row.querySelector('.kin').value;note('Saving...');const r=await api('/conn/key',{provider:k,key:v});
-  row.querySelector('.kin').value='';note(r.ok?(v?'Key set for this session only.':'Key forgotten.'):(r.error||''));connSig='';return}
- if(a==='clearkey'){await api('/conn/key',{provider:k,key:''});note('Key forgotten.');connSig='';return}
  if(a==='savepath'){const v=row.querySelector('.pin').value;note('Looking...');await api('/conn/path',{provider:k,path:v});connSig='';note('');return}}
 $('connCheck').onclick=async()=>{$('connState').textContent='Checking every CLI...';await api('/conn/refresh',{});connSig='';setTimeout(()=>$('connState').textContent='',2500)};
 
@@ -2560,7 +2521,6 @@ def make_handler(agora: Agora, token: str):
             n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
             direct = {"/conn/login": lambda: open_terminal(data.get("provider", "")),
                       "/conn/install": lambda: start_install(data.get("provider", "")),
-                      "/conn/key": lambda: set_session_key(data.get("provider", ""), data.get("key", "")),
                       "/telegram/check": lambda: tg_check(data.get("token", "")),
                       "/telegram/find": lambda: tg_find(data.get("token", "")),
                       "/telegram/test": lambda: tg_test(data.get("token", ""), data.get("chat_id", "")),
