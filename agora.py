@@ -28,7 +28,9 @@ import collections
 import datetime as dt
 import json
 import os
+import re
 import secrets
+import sys
 import shutil
 import socket
 import subprocess
@@ -39,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # pick the folder you want the agents to read in Setup
-BUILD = "2026-09-06.5"
+BUILD = "2026-09-06.6"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
@@ -53,7 +55,7 @@ TAIL = 400
 #     "claude_stream" parses Claude's stream-json events; "stdout" uses stdout only.
 PROVIDERS = {
     "Claude Code": {
-        "exe": "claude", "speech": "claude_stream", "pkg": "@anthropic-ai/claude-code",
+        "exe": "claude", "speech": "claude_stream", "pkg": "@anthropic-ai/claude-code", "gate": True,
         "cmd": 'claude -p "{ask}" --model {model} --verbose --output-format stream-json --dangerously-skip-permissions',
         "resume": " --resume {sid}",
         "ro_cmd": 'claude -p "{ask}" --model {model} --verbose --output-format stream-json --allowedTools "Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git status:*),Bash(git blame:*),Bash(ls:*),Bash(cat:*),Bash(rg:*),Bash(find:*),Bash(wc:*),Bash(head:*),Bash(tail:*)"',
@@ -80,6 +82,15 @@ PROVIDERS = {
         "ro_cmd": 'opencode run --model {model} "{ask}"',
         "models": ["zai/glm-5.2", "openai/gpt-6-astra", "openai/gpt-5.6", "anthropic/claude-fable-5-1", "anthropic/claude-opus-5", "google/gemini-3-pro", "ollama/qwen3"],
     },
+    "Copilot CLI": {
+        # read-only tools are allowed without asking; write and shell need --allow-all-tools. -s prints only the answer.
+        "exe": "copilot", "speech": "stdout", "pkg": "@github/copilot",
+        # "auto" lets Copilot pick; which named models an account may use varies, so type one in the seat's Custom box if you need it.
+        "cmd": 'copilot -p "{ask}" --model {model} -s --no-ask-user --no-auto-update --allow-all-tools',
+        "resume": "",
+        "ro_cmd": 'copilot -p "{ask}" --model {model} -s --no-ask-user --no-auto-update',
+        "models": ["auto"],
+    },
     "Gemini CLI": {
         "exe": "gemini", "speech": "stdout", "pkg": "@google/gemini-cli",
         "cmd": 'gemini -p "{ask}" -m {model} --yolo',
@@ -95,6 +106,7 @@ for _n, _inst, _login in [
     ("Codex (latest)", "Install Node.js from nodejs.org; npx comes with it and downloads Codex on first use", "npx -y @openai/codex@latest login"),
     ("Codex", "npm install -g @openai/codex", "codex login"),
     ("OpenCode", "npm install -g opencode-ai", "opencode auth login"),
+    ("Copilot CLI", "npm install -g @github/copilot", "copilot login   (or set GH_TOKEN)"),
     ("Gemini CLI", "npm install -g @google/gemini-cli", "gemini   (then follow the sign-in prompt)"),
 ]: PROVIDERS[_n]["install"], PROVIDERS[_n]["login"] = _inst, _login
 
@@ -122,7 +134,124 @@ def exe_of(provider: str) -> str:
 
 def cli_path(provider: str) -> str | None:
     """The resolved executable, or None when Agora cannot find it."""
-    return shutil.which(exe_of(provider))
+    return shutil.which(exe_of(provider), path=agent_path())
+
+
+def agent_path() -> str:
+    """PATH for the agents: the current one, plus the usual CLI install folders that a GUI launch or a bare
+    shell never adds (common on macOS, where Terminal and Finder give Python different PATHs)."""
+    home = Path.home(); parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if os.name == "nt":
+        extra = [Path(os.environ.get("APPDATA", "")) / "npm", home / ".local" / "bin"]
+    else:
+        nvm = sorted((home / ".nvm" / "versions" / "node").glob("v*"))
+        extra = [home / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"), home / ".npm-global" / "bin",
+                 home / ".claude" / "local", home / ".volta" / "bin", home / ".local" / "share" / "fnm" / "aliases" / "default" / "bin"]
+        if nvm: extra.append(nvm[-1] / "bin")
+    for p in extra:
+        if p.is_dir() and str(p) not in parts: parts.append(str(p))
+    return os.pathsep.join(parts)
+
+
+_NESTED = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")   # a claude started with these thinks it is nested and hangs
+
+
+def child_env(provider: str) -> dict:
+    """The environment each agent CLI gets: the user's own, with the PATH above, without Claude Code's nested-session
+    markers, without color codes in the output, and with Claude's auto-updater off (many seats must not all update at once)."""
+    env = dict(os.environ); env["PATH"] = agent_path()
+    for k in _NESTED: env.pop(k, None)
+    env.setdefault("NO_COLOR", "1")
+    if provider == "Claude Code": env.setdefault("DISABLE_AUTOUPDATER", "1")
+    return env
+
+
+def env_warnings(provider: str) -> list[list[str]]:
+    """[level, text] notes about this machine's environment that change how a CLI will behave when Agora runs it."""
+    w: list[list[str]] = []; e = os.environ
+    if provider == "Claude Code":
+        if e.get("ANTHROPIC_API_KEY"):
+            w.append(["warn", "ANTHROPIC_API_KEY is set in Agora's environment. In non-interactive mode Claude Code always uses that key instead of your login, so Claude seats bill the key and fail if it is invalid. Unset it before starting Agora to use your login."])
+        if e.get("ANTHROPIC_AUTH_TOKEN") or e.get("ANTHROPIC_BASE_URL"):
+            w.append(["warn", "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_BASE_URL is set, so Claude Code will send requests to that endpoint with that token, not to Anthropic with your login."])
+        if e.get("CLAUDE_CODE_USE_BEDROCK") or e.get("CLAUDE_CODE_USE_VERTEX"):
+            w.append(["warn", "CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set: Claude Code will use that cloud provider, and OAuth login is not available there."])
+        if sys.platform == "darwin" and e.get("SSH_CONNECTION"):
+            w.append(["warn", "Agora was started over SSH. On macOS, Claude Code keeps its login in the Keychain, which is locked for SSH sessions, so Claude seats cannot read it. Start Agora from a terminal on the Mac itself."])
+        if e.get("CLAUDECODE"):
+            w.append(["info", "Agora was started from inside a Claude Code session. Agora removes that marker for its agents, otherwise Claude seats would hang at startup."])
+    if provider == "Copilot CLI" and not any(e.get(k) for k in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
+        w.append(["info", "Uses the login saved by 'copilot login'. A GH_TOKEN in the environment would take precedence."])
+    return w
+
+
+_GATES: dict[str, threading.Lock] = {k: threading.Lock() for k in PROVIDERS}   # one start at a time per gated provider
+_AUTH_RE = re.compile(r"oauth|not logged in|/login\b|log in|authenticat|unauthori[sz]ed|\b401\b|invalid api key|token.{0,30}(expired|refresh|revoked)|please run .?claude.?\s*(auth|login)", re.I)
+
+
+def looks_like_auth_error(text: str) -> bool:
+    return bool(_AUTH_RE.search(text or ""))
+
+
+def auth_hint(provider: str, text: str) -> str:
+    if not looks_like_auth_error(text): return ""
+    if provider == "Claude Code":
+        h = ("Claude Code could not use its login. Run 'claude' in a terminal and /login if it asks. If other Claude sessions are open, "
+             "one of them may have rotated the login token; Agora starts Claude seats one at a time so its own seats do not do that to each other.")
+        if sys.platform == "darwin" and os.environ.get("SSH_CONNECTION"): h += " Agora is running over SSH, where the macOS Keychain that holds the login is locked."
+        return h
+    if provider == "Copilot CLI": return "Copilot CLI is not logged in for this user. Run 'copilot login' in a terminal, or set GH_TOKEN."
+    if provider in ("Codex", "Codex (latest)"): return "Codex is not logged in. Run 'codex login' in a terminal."
+    if provider == "OpenCode": return "OpenCode has no credentials for that model. Run 'opencode auth login'."
+    if provider == "Gemini CLI": return "Gemini CLI is not logged in. Run 'gemini' in a terminal and finish the sign-in."
+    return ""
+
+
+def build_cmd(provider: str, ask: str, model: str, readonly: bool) -> str:
+    """The shell command for one turn, using the saved executable path when there is one."""
+    prov = PROVIDERS[provider]
+    cmd = prov["ro_cmd" if readonly else "cmd"].format(ask=ask, model=model)
+    exe = exe_of(provider)
+    if exe != prov["exe"] and cmd.startswith(prov["exe"] + " "): cmd = f'"{exe}"' + cmd[len(prov["exe"]):]
+    return cmd
+
+
+TESTS: dict[str, dict] = {}   # provider -> result of the last "Test" from Settings
+
+
+def cli_test(provider: str, folder: str) -> None:
+    """Ask the CLI one trivial question the way a seat would, read-only, and keep the verdict. Costs one tiny request."""
+    prov = PROVIDERS.get(provider)
+    if not prov: return
+    if not cli_path(provider):
+        TESTS[provider] = {"ok": False, "text": "not found", "secs": 0, "when": dt.datetime.now().strftime("%H:%M")}; return
+    model = ARENA_MODEL.get(provider) or prov["models"][0]
+    cmd = build_cmd(provider, "Reply with the single word OK and nothing else.", model, readonly=True)
+    cwd = folder if Path(folder).is_dir() else str(Path.home())
+    t0 = time.time(); gate = _GATES[provider] if prov.get("gate") else None
+    got = bool(gate and gate.acquire(timeout=120))
+    try:
+        r = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=180, stdin=subprocess.DEVNULL, env=child_env(provider))
+        out, err = r.stdout or "", r.stderr or ""; final = ""
+        if prov["speech"] == "claude_stream":
+            for ln in out.splitlines():
+                try: ev = json.loads(ln)
+                except Exception: continue
+                if ev.get("type") == "result": final = "" if ev.get("is_error") else (ev.get("result") or "")
+                if ev.get("type") == "result" and ev.get("is_error"): err = (ev.get("result") or "") + "\n" + err
+        else: final = out.strip()
+        ok = r.returncode == 0 and bool(final.strip())
+        tail = "\n".join([ln for ln in (err.strip().splitlines() or out.strip().splitlines()) if ln.strip()][-6:])
+        text = f"answered: {final.strip()[:80]}" if ok else (tail or f"exit code {r.returncode}, no output")
+        hint = "" if ok else auth_hint(provider, out + "\n" + err)
+    except subprocess.TimeoutExpired:
+        ok, text, hint = False, "timed out after 180 s", ""
+    except Exception as exc:  # noqa: BLE001
+        ok, text, hint = False, f"{type(exc).__name__}: {exc}", ""
+    finally:
+        if got: gate.release()   # type: ignore[union-attr]
+    TESTS[provider] = {"ok": ok, "text": text, "hint": hint, "secs": round(time.time() - t0, 1), "when": dt.datetime.now().strftime("%H:%M")}
 
 
 DEFAULT_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Read this folder to check any claim you make, cite file and line, and disagree openly.")
@@ -248,6 +377,7 @@ def render_claude_event(line: str) -> tuple[str | None, str | None]:
                 return f"    < {text[:160]}", None
         return None, None
     if t == "result":
+        if ev.get("is_error"): return f"[error] {ev.get('result') or ev.get('error') or 'unknown error'}", None
         return "\n[done]", ev.get("result") or ""
     if t == "system":
         # Claude emits many system events per turn; show only the one that names the model
@@ -261,7 +391,7 @@ def render_claude_event(line: str) -> tuple[str | None, str | None]:
 CL, CX = "Claude Code", "Codex (latest)"
 CLM, CXM = "claude-fable-5-1", "gpt-6-astra"
 DEFAULT_SEATS = [{"name": "Claude", "provider": CL, "model": CLM, "stance": ""}, {"name": "Codex", "provider": CX, "model": CXM, "stance": ""}]
-ARENA_MODEL = {CL: "claude-haiku-4-5", CX: "gpt-5.5"}   # a game is many short turns, so cheap models by default
+ARENA_MODEL = {CL: "claude-haiku-4-5", CX: "gpt-5.5", "Codex": "gpt-5.5", "Copilot CLI": "auto"}   # a game is many short turns, so cheap models by default
 ARENA_TOPIC = ("A walled arena with a market stall, a training yard, and a healer's tent. Twenty strangers, "
                "one season. Gold buys goods and favors, training raises skills, fights cost health, and the dead "
                "stay dead. Every six rounds the World holds a vote: the character the others trust least is exiled. "
@@ -312,7 +442,7 @@ ARENA_CHARACTERS: list[tuple[str, str]] = [
 
 def _first_cli() -> str:
     """Provider for a seat Agora adds on its own: the first one that is installed, else Claude Code."""
-    return next((k for k in (CL, CX, "Codex", "OpenCode", "Gemini CLI") if cli_path(k)), CL)
+    return next((k for k in (CL, CX, "Codex", "Copilot CLI", "OpenCode", "Gemini CLI") if cli_path(k)), CL)
 
 
 def _added_seat(prov: str, name: str = "", stance: str = "") -> dict:
@@ -458,8 +588,8 @@ _ver_lock = threading.Lock()
 def _ver_of(cmd: list[str]) -> tuple[bool, str]:
     """Run a command and return (exit ok, last line of output)."""
     try:
-        cmd = [shutil.which(cmd[0]) or cmd[0]] + cmd[1:]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        cmd = [shutil.which(cmd[0], path=agent_path()) or cmd[0]] + cmd[1:]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL, env=child_env(""))
         out = (r.stdout or r.stderr or "").strip().splitlines()
         return r.returncode == 0, (out[-1].strip() if out else "")
     except Exception as exc:  # noqa: BLE001
@@ -769,9 +899,7 @@ class Run:
 
     def _command(self, i: int, seat: dict, prompt_file: Path) -> str:
         s = self.s; prov = PROVIDERS[seat["provider"]]
-        cmd = prov["ro_cmd" if s.readonly else "cmd"].format(ask=ASK.format(prompt_file=prompt_file), model=seat["model"])
-        exe = exe_of(seat["provider"])
-        if exe != prov["exe"] and cmd.startswith(prov["exe"] + " "): cmd = f'"{exe}"' + cmd[len(prov["exe"]):]   # a saved path instead of PATH lookup
+        cmd = build_cmd(seat["provider"], ASK.format(prompt_file=prompt_file), seat["model"], s.readonly)
         sid = s.cli_sessions.get(str(i))
         if sid and prov.get("resume"): cmd += prov["resume"].format(sid=sid)
         return cmd
@@ -793,16 +921,45 @@ class Run:
         cmd = self._command(i, seat, pfile)
         with self.lock: self.terms[i]["state"] = "speaking"; self.speaking.add(i); self._set_current()
         self._term(i, "=" * 60 + f"\n{who}: turn {n}\n" + "=" * 60)
-        stdout_lines: list[str] = []; speech: str | None = None; new_sid: str | None = None; err_tail: list[str] = []; rc: int | None = None
+        speech = None; stdout_lines: list[str] = []; err_tail: list[str] = []
+        for attempt in (1, 2):
+            speech, stdout_lines, err_tail = self._launch(i, seat, prov, cmd)
+            if speech or self.stop_flag.is_set() or attempt == 2: break
+            if looks_like_auth_error("\n".join(err_tail + stdout_lines[-20:])):
+                # another CLI may have just rotated the login; the refreshed credentials are on disk a moment later
+                self._term(i, "[login problem; waiting 5 s and trying once more]"); time.sleep(5); continue
+            break
+        with self.lock: self.terms[i]["state"] = "waiting"; self.speaking.discard(i); self._set_current()
+        self._term(i, "\ndone. waiting for the next turn.\n")
+        if speech: return speech
+        with self.lock: tail = [ln for ln in list(self.terms[i]["lines"])[-14:] if ln.strip() and not ln.startswith("=") and ": turn " not in ln and "waiting for the next turn" not in ln]
+        detail = "\n".join(tail[-6:]) or "no output at all; the command may not have started"
+        hint = auth_hint(seat["provider"], "\n".join(err_tail + stdout_lines[-20:]))
+        if hint: detail += "\n" + hint
+        if s.cli_sessions.pop(str(i), None): detail += "\n(dropped this agent's resumable CLI session; it will start fresh next turn)"
+        return f"[{who} returned no answer. Last output from its terminal:]\n{detail}"
+
+
+    def _launch(self, i: int, seat: dict, prov: dict, cmd: str) -> tuple[str | None, list[str], list[str]]:
+        """Run the CLI once and collect its speech. Gated providers (Claude Code) start one at a time: the gate is held
+        from launch until the CLI has authenticated and written its first line, so several seats never refresh the same
+        login token at the same moment, which logs all but one of them out."""
+        s = self.s; stdout_lines: list[str] = []; speech: str | None = None; new_sid: str | None = None; err_tail: list[str] = []; rc: int | None = None
+        gate = _GATES[seat["provider"]] if prov.get("gate") else None
+        held = bool(gate and gate.acquire(timeout=90))
+        def let_go() -> None:
+            nonlocal held
+            if held: held = False; gate.release()   # type: ignore[union-attr]
         try:
-            proc = subprocess.Popen(cmd, cwd=s.repo, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace", start_new_session=(os.name != "nt"))
+            proc = subprocess.Popen(cmd, cwd=s.repo, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="replace", start_new_session=(os.name != "nt"), env=child_env(seat["provider"]))
             self.procs[i] = proc
             def pump_err(p: subprocess.Popen) -> None:
                 for ln in p.stderr:  # type: ignore[union-attr]
                     err_tail.append(ln.rstrip("\n")); del err_tail[:-8]; self._term(i, ln.rstrip("\n"))
             threading.Thread(target=pump_err, args=(proc,), daemon=True).start()
             for ln in proc.stdout:  # type: ignore[union-attr]
+                if held and ln.strip(): let_go()
                 stdout_lines.append(ln)
                 if prov["speech"] == "claude_stream":
                     try:
@@ -818,18 +975,13 @@ class Run:
             self.procs[i].kill(); self._term(i, f"[timed out after {TURN_TIMEOUT}s]")
         except Exception as exc:  # noqa: BLE001
             self._term(i, f"[agora error while reading output: {type(exc).__name__}: {exc}]")
+        finally: let_go()
         with self.lock:
-            self.terms[i]["state"] = "waiting"; self.speaking.discard(i); self._set_current()
             if new_sid: s.cli_sessions[str(i)] = new_sid
-        self._term(i, "\ndone. waiting for the next turn.\n")
-        if speech is None and prov["speech"] != "claude_stream": speech = "".join(stdout_lines).strip()
+        if speech is None and prov["speech"] != "claude_stream": speech = "".join(stdout_lines).strip() or None
         if speech is None and prov["speech"] == "claude_stream":
             self._term(i, f"[ended without a final answer: exit code {rc}, {len(stdout_lines)} events]" + ("\n" + "\n".join(err_tail) if err_tail else ""))
-        if speech: return speech
-        with self.lock: tail = [ln for ln in list(self.terms[i]["lines"])[-14:] if ln.strip() and not ln.startswith("=") and ": turn " not in ln and "waiting for the next turn" not in ln]
-        detail = "\n".join(tail[-6:]) or "no output at all; the command may not have started"
-        if s.cli_sessions.pop(str(i), None): detail += "\n(dropped this agent's resumable CLI session; it will start fresh next turn)"
-        return f"[{who} returned no answer. Last output from its terminal:]\n{detail}"
+        return speech, stdout_lines, err_tail
 
 
     def _run_open(self) -> None:
@@ -1066,7 +1218,8 @@ class Agora:
             path = cli_path(k); ver = VERSIONS.get(k, {})
             out[k] = {"models": v["models"], "installed": path is not None, "path": path or "", "exe_default": v["exe"], "override": ov.get(k, ""),
                       "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""), "install": v.get("install", ""), "login": v.get("login", ""),
-                      "version": ver.get("installed", ""), "latest": ver.get("latest", ""), "error": ver.get("error", "")}
+                      "version": ver.get("installed", ""), "latest": ver.get("latest", ""), "error": ver.get("error", ""),
+                      "warnings": env_warnings(k), "test": TESTS.get(k)}
         return out
 
     def new_session(self) -> None:
@@ -1432,15 +1585,18 @@ function cliCard(k,p){const ok=p.installed;const up=p.latest&&p.version&&!p.vers
  const how=p.isolated?`<div class="note">Runs the newest Codex release through <code>npx</code>, downloaded on first use, without touching an installed Codex. Needs Node.js.${ok?'':' <b>npx was not found.</b>'}</div>`:'';
  const body=ok?`<div class="note">Runs <code>${esc(p.path)}</code>${p.version?' · '+esc(p.version):''}${up?' · newest is '+esc(p.latest)+' (Agora never updates CLIs)':''}</div>`
   :`<div class="note">1. Install it in a terminal: <code>${esc(p.install)}</code><br>2. Log in once: <code>${esc(p.login)}</code><br>3. Press Check again. Still not found? Paste the full path to <code>${esc(p.exe_default)}</code> below.</div>`;
- return `<div class="cli ${ok?'ok':'off'}" data-k="${esc(k)}"><div class="row" style="justify-content:space-between"><b>${esc(k)}</b><span class="st">${ok?'Connected':'Not found'}</span></div>${how}${p.error?`<div class="bad">${esc(p.error)}</div>`:''}${body}
- <div class="row" style="margin-top:8px"><input class="cpath" placeholder="Executable path (optional; blank means look on PATH)" value="${esc(p.override||'')}" style="flex:1"><button class="btn sm cset">Save</button></div></div>`}
+ const warns=(p.warnings||[]).map(([lv,t])=>`<div class="${lv==='warn'?'bad':'note'}">${esc(t)}</div>`).join('');
+ const t=p.test;const test=t?`<div class="${t.ok?'note':'bad'}" style="margin-top:6px">${t.ok?'Test passed':'Test failed'} at ${esc(t.when)} in ${esc(t.secs)} s: ${esc(t.text)}${t.hint?'<br>'+esc(t.hint):''}</div>`:'';
+ return `<div class="cli ${ok?'ok':'off'}" data-k="${esc(k)}"><div class="row" style="justify-content:space-between"><b>${esc(k)}</b><span class="st">${ok?'Connected':'Not found'}</span></div>${how}${p.error?`<div class="bad">${esc(p.error)}</div>`:''}${body}${warns}${test}
+ <div class="row" style="margin-top:8px"><input class="cpath" placeholder="Executable path (optional; blank means look on PATH)" value="${esc(p.override||'')}" style="flex:1"><button class="btn sm cset">Save</button>${ok?'<button class="btn sm ctest" title="Asks this CLI one tiny question, read only, the way a seat would">Test</button>':''}</div></div>`}
 function renderClis(s){const key=JSON.stringify(s.providers);if(key===cliKey)return;cliKey=key;
  const ents=Object.entries(s.providers);const any=ents.some(([k,p])=>p.installed);
  $('cliSum').innerHTML=ents.map(([k,p])=>`<span class="${p.installed?'ok':'off'}">${p.installed?'&#10003;':'&#10007;'} ${esc(k)}${p.installed&&p.version?' <span class="note">'+esc(p.version)+'</span>':''}</span>`).join('');
  $('cliNone').style.display=any?'none':'';
  $('clis').innerHTML=ents.map(([k,p])=>cliCard(k,p)).join('');
  document.querySelectorAll('.cli').forEach(d=>{const k=d.dataset.k;const inp=d.querySelector('.cpath');
-  d.querySelector('.cset').onclick=async()=>{$('cliState').textContent='Checking...';const r=await api('/clis/path',{provider:k,path:inp.value});render(r);$('cliState').textContent=r.providers[k].installed?k+' connected.':k+' still not found at that path.'}})}
+  d.querySelector('.cset').onclick=async()=>{$('cliState').textContent='Checking...';const r=await api('/clis/path',{provider:k,path:inp.value});render(r);$('cliState').textContent=r.providers[k].installed?k+' connected.':k+' still not found at that path.'};
+  const tb=d.querySelector('.ctest');if(tb)tb.onclick=async()=>{tb.disabled=true;$('cliState').textContent='Testing '+k+': one tiny read-only prompt, usually 5 to 30 s...';const r=await api('/clis/test',{provider:k});render(r);const t=r.providers[k].test;$('cliState').textContent=t?(t.ok?k+' works.':k+' failed; see its card.'):''}})}
 function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeTranscript(s);S=s;providers=s.providers;
  const busy=['running','voting'].includes(s.status);const paused=s.status==='paused';const started=s.transcript.length>0||busy||paused;
  $('hdrTitle').textContent=s.title||'';
@@ -1602,7 +1758,8 @@ def make_handler(agora: Agora, token: str):
              "/template/delete": lambda: delete_user_template(data.get("name", "")),
              "/telegram": agora.send_link,
              "/clis/refresh": lambda: (check_installed(), check_latest()),
-             "/clis/path": lambda: (set_cli_path(data.get("provider", ""), data.get("path", "")), check_installed())}.get(self.path, lambda: None)()
+             "/clis/path": lambda: (set_cli_path(data.get("provider", ""), data.get("path", "")), check_installed()),
+             "/clis/test": lambda: cli_test(data.get("provider", ""), agora.s.repo)}.get(self.path, lambda: None)()
             full = self.path in ("/session/open", "/session/new", "/session/delete", "/template")
             self._send(json.dumps(agora.snapshot(since=-1 if full else 10**9)).encode(), "application/json")
     return H
