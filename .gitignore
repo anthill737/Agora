@@ -21,3 +21,6 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+agora_tools/
+agora_codex_auth.bak
