@@ -131,4 +131,4 @@ A few defaults live at the top of `agora.py`:
 
 ## License
 
-Copyright (c) 2026 Anthony Hill. All rights reserved. No license is granted; see [LICENSE](LICENSE).
+Copyright (c) 2026 Hillside Ventures LLC. All rights reserved. No license is granted; see [LICENSE](LICENSE).
