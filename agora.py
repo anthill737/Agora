@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # pick the folder you want the agents to read in Setup
-BUILD = "2026-09-06.4"
+BUILD = "2026-09-06.5"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
@@ -88,6 +88,42 @@ PROVIDERS = {
         "models": ["gemini-3-pro", "gemini-3-flash", "gemini-3-flash-lite"],
     },
 }
+
+# How to get each CLI, shown under Settings > CLIs. Agora only runs CLIs; it never installs, updates, or logs in to them.
+for _n, _inst, _login in [
+    ("Claude Code", "npm install -g @anthropic-ai/claude-code", "claude   (then type /login)"),
+    ("Codex (latest)", "Install Node.js from nodejs.org; npx comes with it and downloads Codex on first use", "npx -y @openai/codex@latest login"),
+    ("Codex", "npm install -g @openai/codex", "codex login"),
+    ("OpenCode", "npm install -g opencode-ai", "opencode auth login"),
+    ("Gemini CLI", "npm install -g @google/gemini-cli", "gemini   (then follow the sign-in prompt)"),
+]: PROVIDERS[_n]["install"], PROVIDERS[_n]["login"] = _inst, _login
+
+# ---------------------------------------------------------------- where each CLI lives
+CLI_FILE = HERE.with_name("agora_clis.json")   # {"Claude Code": "C:\\full\\path\\claude.cmd", ...} for CLIs that are not on PATH
+
+
+def cli_overrides() -> dict:
+    try: return json.loads(CLI_FILE.read_text(encoding="utf-8")) if CLI_FILE.exists() else {}
+    except Exception: return {}
+
+
+def set_cli_path(provider: str, path: str) -> None:
+    if provider not in PROVIDERS: return
+    o = cli_overrides(); path = (path or "").strip().strip('"')
+    if path: o[provider] = path
+    else: o.pop(provider, None)
+    CLI_FILE.write_text(json.dumps(o, indent=1), encoding="utf-8")
+
+
+def exe_of(provider: str) -> str:
+    """What Agora runs for this provider: the path saved in agora_clis.json if any, else the plain command name looked up on PATH."""
+    return (cli_overrides().get(provider) or "").strip() or PROVIDERS[provider]["exe"]
+
+
+def cli_path(provider: str) -> str | None:
+    """The resolved executable, or None when Agora cannot find it."""
+    return shutil.which(exe_of(provider))
+
 
 DEFAULT_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Read this folder to check any claim you make, cite file and line, and disagree openly.")
 
@@ -224,6 +260,12 @@ def render_claude_event(line: str) -> tuple[str | None, str | None]:
 # ---------------------------------------------------------------- templates
 CL, CX = "Claude Code", "Codex (latest)"
 CLM, CXM = "claude-fable-5-1", "gpt-6-astra"
+DEFAULT_SEATS = [{"name": "Claude", "provider": CL, "model": CLM, "stance": ""}, {"name": "Codex", "provider": CX, "model": CXM, "stance": ""}]
+ARENA_MODEL = {CL: "claude-haiku-4-5", CX: "gpt-5.5"}   # a game is many short turns, so cheap models by default
+ARENA_TOPIC = ("A walled arena with a market stall, a training yard, and a healer's tent. Twenty strangers, "
+               "one season. Gold buys goods and favors, training raises skills, fights cost health, and the dead "
+               "stay dead. Every six rounds the World holds a vote: the character the others trust least is exiled. "
+               "Win by being alive, rich, or beloved when the season ends.")
 
 
 PALETTE = ["#22D3EE", "#F59E0B", "#A78BFA", "#34D399", "#F472B6", "#60A5FA", "#FB7185", "#FACC15", "#2DD4BF", "#C084FC",
@@ -235,10 +277,91 @@ def _seat(name: str, prov: str, stance: str = "") -> dict:
 
 
 def color_seats(seats: list[dict]) -> list[dict]:
-    """Give every seat a color if it has none, cycling the palette by position."""
+    """Give every seat without a color the first palette color no other seat is using, then cycle by position."""
+    used = {x.get("color") for x in seats if x.get("color")}
     for i, x in enumerate(seats):
-        if not x.get("color"): x["color"] = PALETTE[i % len(PALETTE)]
+        if x.get("color"): continue
+        x["color"] = next((c for c in PALETTE if c not in used), PALETTE[i % len(PALETTE)]); used.add(x["color"])
     return seats
+
+
+# name, stat block. Used by the Arena template and by the Game switch, which hands one to every seat without a stance.
+ARENA_CHARACTERS: list[tuple[str, str]] = [
+    ("Vex", "Strength 7, Speed 4, Health 12, Gold 3. Skills: none. Hot-tempered mercenary who trusts nobody and wants to be feared."),
+    ("Mira", "Strength 3, Speed 8, Health 9, Gold 6. Skills: none. Quick thief who would rather trade than fight and keeps a mental list of debts."),
+    ("Orrin", "Strength 5, Speed 5, Health 11, Gold 4. Skills: none. Steady farmer's son who wants to go home rich and alive."),
+    ("Sable", "Strength 4, Speed 6, Health 10, Gold 8. Skills: none. Smooth-talking merchant who believes every fight is a failed negotiation."),
+    ("Bram", "Strength 8, Speed 3, Health 13, Gold 2. Skills: none. Slow, loyal, easily flattered; will die for a friend."),
+    ("Ilse", "Strength 4, Speed 7, Health 9, Gold 5. Skills: none. Cold strategist who wants to run the arena by the end."),
+    ("Tomas", "Strength 6, Speed 4, Health 10, Gold 4. Skills: none. Cheerful brawler who forgives too easily."),
+    ("Neri", "Strength 3, Speed 9, Health 8, Gold 7. Skills: none. Paranoid scout who sleeps with one eye open and hoards information."),
+    ("Kade", "Strength 7, Speed 5, Health 11, Gold 3. Skills: none. Ambitious, wants glory more than gold, respects strength."),
+    ("Wren", "Strength 2, Speed 8, Health 8, Gold 9. Skills: none. Frail, rich, and clever; buys protection and remembers who took the coin."),
+    ("Dagny", "Strength 6, Speed 6, Health 10, Gold 4. Skills: none. Fair-minded, hates cheats, will punish a liar even at a loss."),
+    ("Pell", "Strength 5, Speed 5, Health 10, Gold 5. Skills: none. Average in everything and knows it; survives by being useful."),
+    ("Juno", "Strength 4, Speed 7, Health 9, Gold 6. Skills: none. Charming liar who wants everyone to like her right up until it costs them."),
+    ("Halvard", "Strength 9, Speed 2, Health 14, Gold 1. Skills: none. Huge, slow, proud, and broke; will not beg."),
+    ("Tess", "Strength 5, Speed 6, Health 10, Gold 5. Skills: none. Curious tinkerer who trains constantly and avoids fights until ready."),
+    ("Rook", "Strength 6, Speed 5, Health 11, Gold 3. Skills: none. Quiet watcher who acts once, decisively, when it matters."),
+    ("Amara", "Strength 4, Speed 6, Health 10, Gold 7. Skills: none. Healer's apprentice; wants allies, offers rest and trade, fears blood."),
+    ("Gus", "Strength 7, Speed 3, Health 12, Gold 2. Skills: none. Loud, greedy, cowardly when hurt, brave when winning."),
+    ("Lio", "Strength 3, Speed 8, Health 9, Gold 5. Skills: none. Young, fast, reckless, wants a story worth telling."),
+    ("Petra", "Strength 6, Speed 5, Health 11, Gold 4. Skills: none. Grudge-holder with a long memory and a longer plan."),
+]
+
+
+def _first_cli() -> str:
+    """Provider for a seat Agora adds on its own: the first one that is installed, else Claude Code."""
+    return next((k for k in (CL, CX, "Codex", "OpenCode", "Gemini CLI") if cli_path(k)), CL)
+
+
+def _added_seat(prov: str, name: str = "", stance: str = "") -> dict:
+    if not cli_path(prov): prov = _first_cli()
+    return {"name": name, "provider": prov, "model": ARENA_MODEL.get(prov) or PROVIDERS[prov]["models"][0], "stance": stance}
+
+
+def game_shape(s: "Session") -> None:
+    """Make a session playable as a game. Adds what is missing and leaves what the user already set:
+    a World seat as referee, at least four characters when none had a stance, a stat block for every
+    character without one, the arena topic if the topic is still the council default, turns, six rounds."""
+    seats = [dict(x) for x in s.seats]
+    world = next((x for x in seats if s.label(x).lower() == "world" or x.get("stance") == WORLD_STANCE), None)
+    if world is None:
+        world = _added_seat(CL, "World", WORLD_STANCE); seats.insert(0, world)
+    elif not world.get("stance"): world["stance"] = WORLD_STANCE
+    s.referee = s.label(world)
+    players = [x for x in seats if x is not world]
+    if not any(x.get("stance") for x in players):
+        while len(players) < 4:
+            x = _added_seat(CL if len(players) % 2 == 0 else CX); seats.append(x); players.append(x)
+    used = {(x.get("name") or "").lower() for x in seats}
+    pool = [(n, st) for n, st in ARENA_CHARACTERS if n.lower() not in used]
+    for x in players:
+        if x.get("stance") or not pool: continue
+        n, st = pool.pop(0); x["stance"] = st
+        if not x.get("name"): x["name"] = n
+    s.seats = color_seats(seats); s.skipped = [False] * len(seats)
+    if s.topic.strip() in ("", DEFAULT_TOPIC): s.topic = ARENA_TOPIC
+    if s.rounds == 3: s.rounds = 6
+    s.mode = "turns"
+
+
+def council_shape(s: "Session") -> None:
+    """Undo game_shape: drop the World and any character Agora seated untouched, blank borrowed stat blocks,
+    restore the council topic. Keeps every seat the user named or wrote a stance for."""
+    by_name = {n.lower(): st for n, st in ARENA_CHARACTERS}; stances = {st for _, st in ARENA_CHARACTERS}
+    seats = []
+    for x in s.seats:
+        if x.get("stance") == WORLD_STANCE: continue
+        if by_name.get((x.get("name") or "").lower()) == x.get("stance"): continue
+        seats.append({**x, "stance": "" if x.get("stance") in stances else x.get("stance", "")})
+    names = {(x.get("name") or "").lower() for x in seats}
+    for d in DEFAULT_SEATS:
+        if len(seats) >= 2: break
+        if d["name"].lower() not in names: seats.append(dict(d))
+    s.seats = color_seats(seats); s.skipped = [False] * len(seats); s.referee = ""
+    if s.topic.strip() == ARENA_TOPIC: s.topic = DEFAULT_TOPIC
+    if s.rounds == 6: s.rounds = 3
 
 
 TEMPLATES: dict[str, list[dict]] = {
@@ -279,28 +402,7 @@ TEMPLATES: dict[str, list[dict]] = {
     ],
     # a game, not a council: 20 characters plus the World as referee, on cheap models
     "Arena (20 characters + World)": [_seat("World", CL, WORLD_STANCE)] + [
-        _seat(n, CL if i % 2 == 0 else CX, st) for i, (n, st) in enumerate([
-            ("Vex", "Strength 7, Speed 4, Health 12, Gold 3. Skills: none. Hot-tempered mercenary who trusts nobody and wants to be feared."),
-            ("Mira", "Strength 3, Speed 8, Health 9, Gold 6. Skills: none. Quick thief who would rather trade than fight and keeps a mental list of debts."),
-            ("Orrin", "Strength 5, Speed 5, Health 11, Gold 4. Skills: none. Steady farmer's son who wants to go home rich and alive."),
-            ("Sable", "Strength 4, Speed 6, Health 10, Gold 8. Skills: none. Smooth-talking merchant who believes every fight is a failed negotiation."),
-            ("Bram", "Strength 8, Speed 3, Health 13, Gold 2. Skills: none. Slow, loyal, easily flattered; will die for a friend."),
-            ("Ilse", "Strength 4, Speed 7, Health 9, Gold 5. Skills: none. Cold strategist who wants to run the arena by the end."),
-            ("Tomas", "Strength 6, Speed 4, Health 10, Gold 4. Skills: none. Cheerful brawler who forgives too easily."),
-            ("Neri", "Strength 3, Speed 9, Health 8, Gold 7. Skills: none. Paranoid scout who sleeps with one eye open and hoards information."),
-            ("Kade", "Strength 7, Speed 5, Health 11, Gold 3. Skills: none. Ambitious, wants glory more than gold, respects strength."),
-            ("Wren", "Strength 2, Speed 8, Health 8, Gold 9. Skills: none. Frail, rich, and clever; buys protection and remembers who took the coin."),
-            ("Dagny", "Strength 6, Speed 6, Health 10, Gold 4. Skills: none. Fair-minded, hates cheats, will punish a liar even at a loss."),
-            ("Pell", "Strength 5, Speed 5, Health 10, Gold 5. Skills: none. Average in everything and knows it; survives by being useful."),
-            ("Juno", "Strength 4, Speed 7, Health 9, Gold 6. Skills: none. Charming liar who wants everyone to like her right up until it costs them."),
-            ("Halvard", "Strength 9, Speed 2, Health 14, Gold 1. Skills: none. Huge, slow, proud, and broke; will not beg."),
-            ("Tess", "Strength 5, Speed 6, Health 10, Gold 5. Skills: none. Curious tinkerer who trains constantly and avoids fights until ready."),
-            ("Rook", "Strength 6, Speed 5, Health 11, Gold 3. Skills: none. Quiet watcher who acts once, decisively, when it matters."),
-            ("Amara", "Strength 4, Speed 6, Health 10, Gold 7. Skills: none. Healer's apprentice; wants allies, offers rest and trade, fears blood."),
-            ("Gus", "Strength 7, Speed 3, Health 12, Gold 2. Skills: none. Loud, greedy, cowardly when hurt, brave when winning."),
-            ("Lio", "Strength 3, Speed 8, Health 9, Gold 5. Skills: none. Young, fast, reckless, wants a story worth telling."),
-            ("Petra", "Strength 6, Speed 5, Health 11, Gold 4. Skills: none. Grudge-holder with a long memory and a longer plan."),
-        ])],
+        _seat(n, CL if i % 2 == 0 else CX, st) for i, (n, st) in enumerate(ARENA_CHARACTERS)],
     # names only, no stances
     "Blank: 2 agents": [_seat("Claude", CL), _seat("Codex", CX)],
     "Blank: 4 agents": [_seat("Claude A", CL), _seat("Codex A", CX), _seat("Claude B", CL), _seat("Codex B", CX)],
@@ -349,30 +451,43 @@ def ensure_codex_trust(folder: str) -> str | None:
 
 
 # ---------------------------------------------------------------- versions
-VERSIONS: dict[str, dict] = {}     # provider -> {"installed": str, "latest": str}
+VERSIONS: dict[str, dict] = {}     # provider -> {"installed": str, "latest": str, "error": str}
 _ver_lock = threading.Lock()
 
 
-def _ver_of(cmd: list[str]) -> str:
+def _ver_of(cmd: list[str]) -> tuple[bool, str]:
+    """Run a command and return (exit ok, last line of output)."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25, shell=(os.name == "nt"))
+        cmd = [shutil.which(cmd[0]) or cmd[0]] + cmd[1:]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
         out = (r.stdout or r.stderr or "").strip().splitlines()
-        return out[-1].strip() if out else ""
-    except Exception: return ""
+        return r.returncode == 0, (out[-1].strip() if out else "")
+    except Exception as exc:  # noqa: BLE001
+        return False, type(exc).__name__
+
+
+def check_installed() -> None:
+    """Which CLIs Agora can run right now. Synchronous, a few seconds at most."""
+    for name, prov in PROVIDERS.items():
+        path = cli_path(name)
+        ok, text = (True, "") if prov.get("isolated") and path else (_ver_of([path, "--version"]) if path else (False, ""))
+        with _ver_lock:
+            v = VERSIONS.setdefault(name, {}); v["installed"] = text if ok else ""
+            v["error"] = "" if ok or not path else f"Found {path} but '--version' failed: {text or 'no output'}"
+
+
+def check_latest() -> None:
+    """Newest published version of each CLI, from npm, in the background. Never blocks the UI."""
+    def work() -> None:
+        for name, prov in PROVIDERS.items():
+            if prov.get("isolated") or not prov.get("pkg") or not shutil.which("npm"): continue
+            ok, latest = _ver_of(["npm", "view", prov["pkg"], "version"])
+            with _ver_lock: VERSIONS.setdefault(name, {})["latest"] = latest if ok else ""
+    threading.Thread(target=work, daemon=True).start()
 
 
 def refresh_versions() -> None:
-    """Installed versions now, latest from npm in the background. Never blocks the UI."""
-    def work() -> None:
-        for name, prov in PROVIDERS.items():
-            if prov.get("isolated"): continue
-            inst = _ver_of([prov["exe"], "--version"]) if shutil.which(prov["exe"]) else ""
-            with _ver_lock: VERSIONS.setdefault(name, {})["installed"] = inst
-        for name, prov in PROVIDERS.items():
-            if prov.get("isolated") or not prov.get("pkg") or not shutil.which("npm"): continue
-            latest = _ver_of(["npm", "view", prov["pkg"], "version"])
-            with _ver_lock: VERSIONS.setdefault(name, {})["latest"] = latest
-    threading.Thread(target=work, daemon=True).start()
+    threading.Thread(target=check_installed, daemon=True).start(); check_latest()
 
 
 # ---------------------------------------------------------------- telegram
@@ -426,10 +541,7 @@ class Session:
         self.title = d.get("title", "")
         self.created = d.get("created", dt.datetime.now().isoformat(timespec="minutes"))
         self.repo = d.get("repo", DEFAULT_REPO)
-        self.seats = color_seats(d.get("seats", [
-            {"name": "Claude", "provider": "Claude Code", "model": "claude-fable-5-1", "stance": ""},
-            {"name": "Codex", "provider": "Codex (latest)", "model": "gpt-6-astra", "stance": ""},
-        ]))
+        self.seats = color_seats(d.get("seats", [dict(x) for x in DEFAULT_SEATS]))
         self.topic = d.get("topic", DEFAULT_TOPIC); self.extra = d.get("extra", "")
         self.rounds = d.get("rounds", 3); self.readonly = d.get("readonly", True)
         self.mode = d.get("mode", "turns")   # turns | open
@@ -658,6 +770,8 @@ class Run:
     def _command(self, i: int, seat: dict, prompt_file: Path) -> str:
         s = self.s; prov = PROVIDERS[seat["provider"]]
         cmd = prov["ro_cmd" if s.readonly else "cmd"].format(ask=ASK.format(prompt_file=prompt_file), model=seat["model"])
+        exe = exe_of(seat["provider"])
+        if exe != prov["exe"] and cmd.startswith(prov["exe"] + " "): cmd = f'"{exe}"' + cmd[len(prov["exe"]):]   # a saved path instead of PATH lookup
         sid = s.cli_sessions.get(str(i))
         if sid and prov.get("resume"): cmd += prov["resume"].format(sid=sid)
         return cmd
@@ -671,9 +785,9 @@ class Run:
     def _speak(self, i: int, seat: dict, instruction: str) -> str:
         s = self.s; who = s.label(seat); prov = PROVIDERS[seat["provider"]]
         if self.stop_flag.is_set(): return f"[{who} was not asked: the conversation was stopped]"
-        if shutil.which(prov["exe"]) is None:
-            self._term(i, f"'{prov['exe']}' is not installed or not on PATH")
-            return f"[{who} returned no answer. '{prov['exe']}' is not installed or not on PATH]"
+        if cli_path(seat["provider"]) is None:
+            self._term(i, f"'{exe_of(seat['provider'])}' was not found. Open Settings > CLIs to connect it.")
+            return f"[{who} returned no answer. '{exe_of(seat['provider'])}' was not found. Open Settings > CLIs to connect it.]"
         n = s.turn + 1
         pfile = s.seat_dir(i) / f"prompt_{n:03d}_{int(time.time() * 1000) % 100000}.md"; pfile.write_text(self._prompt(i, seat, instruction), encoding="utf-8")
         cmd = self._command(i, seat, pfile)
@@ -835,7 +949,7 @@ class Run:
 
     def _run(self) -> None:
         s = self.s; seats = list(s.seats)
-        missing = [f"{s.label(x)}: '{PROVIDERS[x['provider']]['exe']}' is not installed or not on PATH" for x in seats if shutil.which(PROVIDERS[x["provider"]]["exe"]) is None]
+        missing = [f"{s.label(x)}: '{exe_of(x['provider'])}' was not found. Open Settings > CLIs to connect it." for x in seats if cli_path(x["provider"]) is None]
         if missing:
             for e in missing: self._record("Agora", e, "system")
             with self.lock: s.status = "idle"; self.current = None; s.save()
@@ -944,10 +1058,16 @@ class Agora:
                     "phone_url": self.phone_url, "away_url": self.away_url, "last_tg": self.last_tg,
                     "tg_ready": bool((tg_config().get("token") or "").strip()),
                     "templates": list(TEMPLATES.keys()), "user_templates": list(user_templates().keys()), "sessions_dir": str(SESSIONS), "build": BUILD,
-                    "providers": {k: {"models": v["models"], "installed": shutil.which(v["exe"]) is not None,
-                                      "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
-                                      "version": VERSIONS.get(k, {}).get("installed", ""), "latest": VERSIONS.get(k, {}).get("latest", "")}
-                                  for k, v in PROVIDERS.items()}}
+                    "providers": self._providers()}
+
+    def _providers(self) -> dict:
+        ov = cli_overrides(); out = {}
+        for k, v in PROVIDERS.items():
+            path = cli_path(k); ver = VERSIONS.get(k, {})
+            out[k] = {"models": v["models"], "installed": path is not None, "path": path or "", "exe_default": v["exe"], "override": ov.get(k, ""),
+                      "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""), "install": v.get("install", ""), "login": v.get("login", ""),
+                      "version": ver.get("installed", ""), "latest": ver.get("latest", ""), "error": ver.get("error", "")}
+        return out
 
     def new_session(self) -> None:
         with self.lock:
@@ -969,7 +1089,7 @@ class Agora:
         name = (name or "").strip()
         if not name: return
         s = self.s
-        save_user_template(name, {"seats": [dict(x) for x in s.seats], "framing": s.framing, "mode": s.mode, "rounds": s.rounds,
+        save_user_template(name, {"seats": [dict(x) for x in s.seats], "framing": s.framing, "referee": s.referee, "mode": s.mode, "rounds": s.rounds,
                                   "readonly": s.readonly, "topic": s.topic, "extra": s.extra, "repo": s.repo,
                                   "max_messages": s.max_messages, "max_minutes": s.max_minutes})
 
@@ -981,20 +1101,17 @@ class Agora:
             if name in ut:   # a saved layout: restore everything
                 d = ut[name]; s = r.s
                 s.seats = color_seats([dict(x) for x in d.get("seats", [])]); s.skipped = [False] * len(s.seats)
-                for k in ("framing", "mode", "rounds", "readonly", "topic", "extra", "repo", "max_messages", "max_minutes"):
+                for k in ("framing", "referee", "mode", "rounds", "readonly", "topic", "extra", "repo", "max_messages", "max_minutes"):
                     if k in d: setattr(s, k, d[k])
+                if s.framing == "game" and not s.referee: game_shape(s)
                 r._reset_terms(); s.save(); return
             if name not in TEMPLATES: return
             seats = [dict(x) for x in TEMPLATES[name]]
             if name.startswith("Arena"):
-                for x in seats: x["model"] = "claude-haiku-4-5" if x["provider"] == CL else "gpt-5.5"
-                r.s.framing = "game"; r.s.mode = "turns"; r.s.rounds = 6
-                r.s.topic = ("A walled arena with a market stall, a training yard, and a healer's tent. Twenty strangers, "
-                             "one season. Gold buys goods and favors, training raises skills, fights cost health, and the dead "
-                             "stay dead. Every six rounds the World holds a vote: the character the others trust least is exiled. "
-                             "Win by being alive, rich, or beloved when the season ends.")
+                for x in seats: x["model"] = ARENA_MODEL.get(x["provider"], x["model"])
+                r.s.framing = "game"; r.s.mode = "turns"; r.s.rounds = 6; r.s.topic = ARENA_TOPIC; r.s.referee = "World"
             else:
-                r.s.framing = "council"
+                r.s.framing = "council"; r.s.referee = ""
             r.s.seats = color_seats(seats); r.s.skipped = [False] * len(r.s.seats)
             r._reset_terms(); r.s.save()
 
@@ -1026,8 +1143,12 @@ class Agora:
             if "rounds" in d: s.rounds = max(1, int(d["rounds"]))
             if "readonly" in d: s.readonly = bool(d["readonly"])
             if d.get("mode") in ("turns", "open"): s.mode = d["mode"]
-            if d.get("framing") in ("council", "game"): s.framing = d["framing"]
+            if d.get("framing") in ("council", "game") and d["framing"] != s.framing:
+                s.framing = d["framing"]
+                if not s.transcript and not r.busy():   # a draft: reshape the seats so the new framing actually works
+                    (game_shape if s.framing == "game" else council_shape)(s); r._reset_terms()
             if "referee" in d: s.referee = (d["referee"] or "").strip()
+            if s.referee and s.referee.lower() not in {s.label(x).lower() for x in s.seats}: s.referee = ""
             if "max_messages" in d: s.max_messages = max(0, int(d["max_messages"] or 0))
             if "max_minutes" in d: s.max_minutes = max(0, int(d["max_minutes"] or 0))
             if d.get("repo"): s.repo = d["repo"]
@@ -1152,6 +1273,9 @@ textarea{line-height:1.55}
 .check{display:flex;gap:10px;align-items:flex-start;cursor:pointer}.check input{width:18px;height:18px;margin-top:2px}
 .note{font-size:12px;color:var(--muted);line-height:1.45}.bad{color:var(--danger);font-size:12px;margin-top:6px}
 .vers{display:flex;flex-direction:column;gap:4px}
+.clisum{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px}.clisum .ok{color:#34D399}.clisum .off{color:var(--danger)}
+.cli{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:8px;font-size:13px}.cli .st{font-weight:600;white-space:nowrap}.cli.ok .st{color:#34D399}.cli.off .st{color:var(--danger)}
+.cli code{font:12px ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;word-break:break-all}.cli .note{margin-top:6px}
 .sheetwrap .panel{width:min(520px,100%);background:var(--s1);border-left:1px solid var(--line);overflow:auto;padding:22px 24px}
 .sheetwrap .panel h1{font-size:16px;margin:0 0 12px;display:flex;justify-content:space-between;align-items:center}
 /* terminals drawer */
@@ -1207,6 +1331,7 @@ textarea{line-height:1.55}
 <main id="center">
  <section id="setup"><div class="inner">
   <h1>New conversation</h1><p class="lead">Seat the council, set the topic, press Start. You can message them any time.</p>
+  <div class="field"><label>Your CLIs <span class="note">(each agent is one of these, run the way you run it in a terminal)</span></label><div id="cliSum" class="clisum"></div><div id="cliNone" class="bad" style="display:none">Agora found no CLI. Install one, log in to it once in a terminal, then check again.</div><div class="row" style="margin-top:8px"><button id="cliOpen" class="btn sm">Connect or check CLIs</button></div></div>
   <div class="field"><label>Title</label><input id="title" placeholder="Named from the topic if left blank"></div>
   <div class="field"><label>Folder the agents work in</label><div class="row"><input id="repo"><button id="browse" class="btn">Browse</button></div><div id="repoBad" class="bad"></div></div>
   <div class="field"><label>Agents <span class="note" id="seatNote">(they speak in this order)</span></label>
@@ -1221,7 +1346,6 @@ textarea{line-height:1.55}
   <div class="two" id="limits"><div class="field"><label>Close the floor after this many messages</label><input id="maxMsgs" type="number" min="0" placeholder="no limit"></div><div class="field"><label>Or after this many minutes</label><input id="maxMins" type="number" min="0" placeholder="no limit"></div></div>
   <div class="two"><div class="field"><label id="roundsLabel">Rounds</label><input id="rounds" type="number" min="1"><div class="note" id="roundsNote" style="margin-top:6px">Each agent speaks once per round, then gives a closing statement.</div></div>
    <div class="field"><label>Access</label><label class="check"><input id="ro" type="checkbox"><span>Read only<br><span class="note">Agents can read and search but not run or change anything.</span></span></label><div class="note" id="roNote" style="margin-top:6px"></div></div></div>
-  <div class="field"><label>Installed CLIs</label><div id="vers" class="vers note"></div></div>
   <div class="field"><button id="start2" class="primary" style="padding:10px 22px">Start conversation</button></div>
  </div></section>
  <section id="chat"><div class="inner" id="chatInner"><div class="empty" id="chatEmpty" style="text-align:center;padding-top:8vh"><svg class="ringart" viewBox="0 0 32 32" aria-hidden="true"><g fill="currentColor"><circle cx="16" cy="16" r="2.4"/><g opacity=".55"><circle cx="16" cy="4" r="1.6"/><circle cx="24.5" cy="7.5" r="1.6"/><circle cx="28" cy="16" r="1.6"/><circle cx="24.5" cy="24.5" r="1.6"/><circle cx="16" cy="28" r="1.6"/><circle cx="7.5" cy="24.5" r="1.6"/><circle cx="4" cy="16" r="1.6"/><circle cx="7.5" cy="7.5" r="1.6"/></g></g></svg><div>The floor is empty. Each agent's turn appears here as it finishes.</div></div><div id="msgs"></div><div class="typing" id="typing" style="display:none"></div></div></section>
@@ -1236,6 +1360,9 @@ textarea{line-height:1.55}
   <div class="kv"><span>Anywhere</span><code id="awayUrl">not available</code><button class="btn sm cp" data-for="awayUrl">Copy</button></div>
   <div class="kv"><span>Home wifi</span><code id="homeUrl">not available</code><button class="btn sm cp" data-for="homeUrl">Copy</button></div>
   <div class="row" style="margin-top:8px"><button id="tg" class="btn">Send link to my Telegram</button><span class="note" id="tgState"></span></div></section>
+ <section class="sg"><h2>CLIs</h2><div class="note">Agora talks to each agent by running its CLI, the same command you type in a terminal, inside the folder you pick. Install a CLI, log in to it once in a terminal, and Agora can seat it. Agora never installs, updates, or logs in for you. If a CLI is installed but Agora cannot find it, paste the full path to its executable and press Save.</div>
+  <div id="clis"></div>
+  <div class="row" style="margin-top:10px"><button id="cliCheck" class="btn sm">Check again</button><span class="note" id="cliState"></span></div></section>
  <section class="sg"><h2>Display</h2>
   <div class="kv"><span>Text size</span><span class="row"><button class="btn sm" id="fsDown">Smaller</button><button class="btn sm" id="fsUp">Larger</button></span></div>
   <div class="kv" id="termRow"><span>Terminals</span><button class="btn sm" id="termBtn">Show or hide</button></div>
@@ -1275,7 +1402,7 @@ function seatModel(d){const sel=d.querySelector('.msel');return sel.value==='__c
 function seatsFromDom(){return [...document.querySelectorAll('.seat')].map(d=>({name:d.querySelector('.n').value,provider:d.querySelector('.p').value,model:seatModel(d),stance:d.querySelector('.s').value,color:d.querySelector('.c').value}))}
 function seatHtml(s,i,locked){const p=providers[s.provider]||{models:[],installed:true};const dis=locked?'disabled':'';const ndis=locked?'disabled':'';
  const opts=Object.keys(providers).map(k=>`<option ${k===s.provider?'selected':''}>${esc(k)}</option>`).join('');
- return `<div class="seat" data-i="${i}"><div class="hdr ${p.installed?'':'off'}"><span><span class="av" style="--c:${esc(s.color||'#22D3EE')};width:18px;height:18px;font-size:10px;margin-right:6px;vertical-align:middle">${esc((s.name||String(i+1))[0])}</span>Agent ${i+1}${p.installed?'':' · CLI not installed'}</span>${locked?'':'<button class="x" style="padding:0;color:var(--faint)">Remove</button>'}</div>
+ return `<div class="seat" data-i="${i}"><div class="hdr ${p.installed?'':'off'}"><span><span class="av" style="--c:${esc(s.color||'#22D3EE')};width:18px;height:18px;font-size:10px;margin-right:6px;vertical-align:middle">${esc((s.name||String(i+1))[0])}</span>Agent ${i+1}${p.installed?'':' · CLI not found, see Settings'}</span>${locked?'':'<button class="x" style="padding:0;color:var(--faint)">Remove</button>'}</div>
  <div class="row"><input type="color" class="c" value="${esc(s.color||'#22D3EE')}" title="Agent color" aria-label="Agent color"><input class="n" placeholder="Name" value="${esc(s.name)}" ${ndis}></div><select class="p" aria-label="Provider">${opts}</select>
  <div class="mwrap"><select class="msel" aria-label="Model">${p.models.map(m=>`<option ${m===s.model?'selected':''}>${esc(m)}</option>`).join('')}<option value="__custom" ${p.models.includes(s.model)?'':'selected'}>Custom...</option></select><input class="mcustom" placeholder="Type a model name" value="${p.models.includes(s.model)?'':esc(s.model)}" style="display:${p.models.includes(s.model)?'none':''};margin-top:6px"></div>
  <input class="s full" placeholder="Stance or role (optional)" value="${esc(s.stance)}"></div>`}
@@ -1300,9 +1427,20 @@ function renderHist(s){const live=new Set(s.live||[]);$('railCount').textContent
  $('hlist').innerHTML=(L.length?'<div class="hsec">Live now</div>'+L.map(item).join(''):'')+(E.length?'<div class="hsec">'+(L.length?'Earlier':'All')+'</div>'+E.map(item).join(''):'');
  document.querySelectorAll('.hitem').forEach(d=>{d.onkeydown=e=>{if(e.key==='Enter')d.click()};d.onclick=async e=>{if(e.target.classList.contains('del')){if(confirm('Delete this conversation and its transcript?'))render(await api('/session/delete',{id:e.target.dataset.id}));return}
   S=null;termKey='';render(await api('/session/open',{id:d.dataset.id}));if(mobile())showTab('chat')}})}
-function renderVers(s){$('vers').innerHTML=Object.entries(s.providers).map(([k,p])=>{if(p.isolated)return `<div>${esc(k)}: runs the newest Codex release, downloaded on first use, without touching your installed Codex.</div>`;
- const inst=p.installed?(p.version||'installed'):'not installed';const up=p.latest&&p.version&&!p.version.includes(p.latest);
- return `<div class="row"><span>${esc(k)}: <b style="color:var(--text)">${esc(inst)}</b>${p.latest?' · latest '+esc(p.latest):''}${up?' <span style="color:var(--faint)">(Agora never updates installed CLIs)</span>':''}</span></div>`}).join('')}
+let cliKey='';
+function cliCard(k,p){const ok=p.installed;const up=p.latest&&p.version&&!p.version.includes(p.latest);
+ const how=p.isolated?`<div class="note">Runs the newest Codex release through <code>npx</code>, downloaded on first use, without touching an installed Codex. Needs Node.js.${ok?'':' <b>npx was not found.</b>'}</div>`:'';
+ const body=ok?`<div class="note">Runs <code>${esc(p.path)}</code>${p.version?' · '+esc(p.version):''}${up?' · newest is '+esc(p.latest)+' (Agora never updates CLIs)':''}</div>`
+  :`<div class="note">1. Install it in a terminal: <code>${esc(p.install)}</code><br>2. Log in once: <code>${esc(p.login)}</code><br>3. Press Check again. Still not found? Paste the full path to <code>${esc(p.exe_default)}</code> below.</div>`;
+ return `<div class="cli ${ok?'ok':'off'}" data-k="${esc(k)}"><div class="row" style="justify-content:space-between"><b>${esc(k)}</b><span class="st">${ok?'Connected':'Not found'}</span></div>${how}${p.error?`<div class="bad">${esc(p.error)}</div>`:''}${body}
+ <div class="row" style="margin-top:8px"><input class="cpath" placeholder="Executable path (optional; blank means look on PATH)" value="${esc(p.override||'')}" style="flex:1"><button class="btn sm cset">Save</button></div></div>`}
+function renderClis(s){const key=JSON.stringify(s.providers);if(key===cliKey)return;cliKey=key;
+ const ents=Object.entries(s.providers);const any=ents.some(([k,p])=>p.installed);
+ $('cliSum').innerHTML=ents.map(([k,p])=>`<span class="${p.installed?'ok':'off'}">${p.installed?'&#10003;':'&#10007;'} ${esc(k)}${p.installed&&p.version?' <span class="note">'+esc(p.version)+'</span>':''}</span>`).join('');
+ $('cliNone').style.display=any?'none':'';
+ $('clis').innerHTML=ents.map(([k,p])=>cliCard(k,p)).join('');
+ document.querySelectorAll('.cli').forEach(d=>{const k=d.dataset.k;const inp=d.querySelector('.cpath');
+  d.querySelector('.cset').onclick=async()=>{$('cliState').textContent='Checking...';const r=await api('/clis/path',{provider:k,path:inp.value});render(r);$('cliState').textContent=r.providers[k].installed?k+' connected.':k+' still not found at that path.'}})}
 function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeTranscript(s);S=s;providers=s.providers;
  const busy=['running','voting'].includes(s.status);const paused=s.status==='paused';const started=s.transcript.length>0||busy||paused;
  $('hdrTitle').textContent=s.title||'';
@@ -1316,7 +1454,8 @@ function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeT
  const can=busy||paused;$('sayBtn').disabled=!can;$('sayText').placeholder='Message the agents';
  $('roNote').textContent=s.readonly?'':'Full access: no permission prompts, agents can edit files. Use a folder with a clean git status.';
  $('repoBad').textContent=s.repo_ok?'':'That folder does not exist.';
- const game=s.framing==='game';$('frCouncil').classList.toggle('on',!game);$('frGame').classList.toggle('on',game);$('frCouncil').disabled=busy;$('frGame').disabled=busy;$('frNote').textContent=game?'Characters with fixed stats. Words persuade, only the World changes numbers, every message ends with one ACTION line. Seat one agent named World with the referee stance.':'Agents debate the topic, cite the folder, and give closing statements.';
+ const game=s.framing==='game';$('frCouncil').classList.toggle('on',!game);$('frGame').classList.toggle('on',game);$('frCouncil').disabled=busy;$('frGame').disabled=busy;$('frNote').textContent=game?(s.referee?'Characters with fixed stats. Words persuade, only the World changes numbers, every message ends with one ACTION line. Switching to Game seated the World as referee, gave every character without a stance a stat block, set the arena topic, turns, and six rounds. Edit any of it above.':'No referee: the game has nobody to resolve actions. Pick one below, or add an agent named World.'):'Agents debate the topic, cite the folder, and give closing statements. Switching back from Game removes the World and the characters Agora seated.';
+ $('frNote').classList.toggle('bad',game&&!s.referee);
  const open=s.mode==='open';$('modeTurns').classList.toggle('on',!open);$('modeOpen').classList.toggle('on',open);$('modeTurns').disabled=busy;$('modeOpen').disabled=busy;
  $('modeNote').textContent=(s.framing==='game'?'Game framing: characters with fixed stats, the World referees. ':'')+(open?'No turns. Every message goes to everyone at once and each agent replies or passes. Use @Name to demand an answer. The floor closes when everyone passes, when a limit below is hit, or when you press End.':'Agents speak one after another in seat order.');
  $('refField').style.display=game?'':'none';const ropts='<option value="">None</option>'+s.seats.map(x=>`<option value="${esc(lbl(x))}" ${lbl(x)===s.referee?'selected':''}>${esc(lbl(x))}</option>`).join('');if($('referee').innerHTML!==ropts)$('referee').innerHTML=ropts;$('referee').value=s.referee||'';
@@ -1327,7 +1466,8 @@ function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeT
  const ut=s.user_templates||[];const topts='<option value="">Start from a template...</option>'+(ut.length?'<optgroup label="My templates">'+ut.map(t=>`<option>${esc(t)}</option>`).join('')+'</optgroup>':'')+'<optgroup label="Built in">'+(s.templates||[]).map(t=>`<option>${esc(t)}</option>`).join('')+'</optgroup>';
  if($('tmpl').innerHTML!==topts){const cur=$('tmpl').value;$('tmpl').innerHTML=topts;$('tmpl').value=cur}$('tmpl').disabled=started||busy;$('tmplApply').disabled=started||busy;$('tmplDel').style.display=ut.includes($('tmpl').value)?'':'none';
  if(first||!editing){$('title').value=s.title;$('repo').value=s.repo;$('topic').value=s.topic;$('extra').value=s.extra;$('rounds').value=s.rounds;$('maxMsgs').value=s.max_messages||'';$('maxMins').value=s.max_minutes||'';$('ro').checked=s.readonly;
-  if(first||seatsLocked!==started||JSON.stringify(seatsFromDom())!==JSON.stringify(s.seats.map(x=>({name:x.name,provider:x.provider,model:x.model,stance:x.stance,color:x.color})))){renderSeats(s.seats,started);seatsLocked=started}renderVers(s)}
+  if(first||seatsLocked!==started||JSON.stringify(seatsFromDom())!==JSON.stringify(s.seats.map(x=>({name:x.name,provider:x.provider,model:x.model,stance:x.stance,color:x.color})))){renderSeats(s.seats,started);seatsLocked=started}}
+ renderClis(s);
  renderHist(s);
  // empty-state setup vs conversation
  if(!mobile()){$('setup').style.display=started||busy?'none':'block';$('chat').style.display=started||busy?'block':'none';$('composer').style.display=started||busy?'':'none';document.body.classList.toggle('autoterm',!(started||busy))}
@@ -1383,6 +1523,8 @@ $('sayText').onkeydown=e=>{const open=$('ac').classList.contains('open');
  if(open&&(e.key==='Enter'||e.key==='Tab')){e.preventDefault();acPick(acIdx);return}
  if(open&&e.key==='Escape'){acClose();return}
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('sayBtn').click()}};
+$('cliOpen').onclick=()=>openSettings();
+$('cliCheck').onclick=async()=>{$('cliState').textContent='Checking...';render(await api('/clis/refresh',{}));$('cliState').textContent='Checked '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})};
 $('tg').onclick=async()=>{$('tgState').textContent='Sending...';const r=await api('/telegram',{});$('tgState').textContent=r.last_tg||'No response'};
 let saveTimer=null;['title','repo','topic','extra','rounds','maxMsgs','maxMins'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
 $('ro').onchange=save;$('referee').onchange=async()=>render(await api('/config',{referee:$('referee').value}));$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
@@ -1458,7 +1600,9 @@ def make_handler(agora: Agora, token: str):
              "/template": lambda: agora.apply_template(data.get("name", "")),
              "/template/save": lambda: agora.save_template(data.get("name", "")),
              "/template/delete": lambda: delete_user_template(data.get("name", "")),
-             "/telegram": agora.send_link}.get(self.path, lambda: None)()
+             "/telegram": agora.send_link,
+             "/clis/refresh": lambda: (check_installed(), check_latest()),
+             "/clis/path": lambda: (set_cli_path(data.get("provider", ""), data.get("path", "")), check_installed())}.get(self.path, lambda: None)()
             full = self.path in ("/session/open", "/session/new", "/session/delete", "/template")
             self._send(json.dumps(agora.snapshot(since=-1 if full else 10**9)).encode(), "application/json")
     return H

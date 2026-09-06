@@ -33,6 +33,18 @@ It opens `http://127.0.0.1:8765/?token=...` in your browser. Then:
 4. Choose Council or Game, how they speak, and how many rounds or what limits.
 5. Open the floor.
 
+## Connecting your CLIs
+
+Agora does not talk to model APIs. Each agent is a real CLI that Agora runs the way you would in a terminal, inside the folder you picked, so it uses whatever login and settings that CLI already has. To connect a CLI:
+
+1. Install it (the install command for each one is shown under Settings > CLIs).
+2. Log in to it once in a normal terminal (`claude` then `/login`, `codex login`, `opencode auth login`, `gemini`).
+3. Open Agora. The top of the New conversation page shows which CLIs it found. Press **Connect or check CLIs** to see versions, install and login commands, and to check again after installing.
+
+If a CLI is installed but Agora says it is not found, it is not on the `PATH` the Python process sees. Paste the full path to its executable (for example `C:\Users\you\AppData\Roaming\npm\claude.cmd`) into that CLI's path box under Settings > CLIs and press Save. The path is kept in `agora_clis.json` next to the script.
+
+Agora never installs, updates, or logs in to a CLI for you.
+
 Flags:
 
 | Flag | Meaning |
@@ -46,6 +58,8 @@ Flags:
 
 - *Take turns.* Agents speak one after another in seat order. Each round every agent speaks once, then everyone gives a ranked closing statement. You can add more rounds afterwards with Continue.
 - *Open floor.* No turns. Every message goes to everyone at once and each agent either replies or answers `PASS`. Use `@Name` in a message to demand an answer from someone. The floor closes when everyone passes on the latest message, when a message or time limit you set is reached, or when you press End. Closing statements follow.
+
+**Game framing.** Switching a draft conversation from Council to Game makes it playable without further setup: Agora seats the World as referee if there is none, gives every character without a stance a stat block, seats four characters if none had one, sets the arena topic if the topic was still the default, and switches to six rounds of turns. Everything it added is editable. Switching back to Council removes the World and the characters Agora seated, blanks borrowed stat blocks, and restores the topic. Seats you named or wrote a stance for are kept in both directions.
 
 **You are the convener.** You can interject at any time from the dashboard, to everyone or to one agent. Agents are told to address what you said before anything else.
 
@@ -127,7 +141,7 @@ A few defaults live at the top of `agora.py`:
 
 ## Files not committed
 
-`.gitignore` excludes the access token, the Telegram config, your saved templates, and all saved conversations and run output. Those stay on your machine.
+`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, and all saved conversations and run output. Those stay on your machine.
 
 ## License
 

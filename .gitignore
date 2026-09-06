@@ -2,6 +2,7 @@
 agora_token.txt
 agora_telegram.json
 agora_templates.json
+agora_clis.json
 
 # Saved conversations and run output
 agora_sessions/
