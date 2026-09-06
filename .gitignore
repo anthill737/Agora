@@ -1,6 +1,7 @@
 # Secrets and local config
 agora_token.txt
 agora_telegram.json
+agora_templates.json
 
 # Saved conversations and run output
 agora_sessions/
