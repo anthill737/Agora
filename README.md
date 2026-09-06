@@ -16,6 +16,7 @@ Requirements:
 - At least one provider CLI installed, on `PATH`, and logged in:
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
   - [Codex](https://github.com/openai/codex) (`codex`, or `npx` for the "Codex (latest)" seat)
+  - [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli) (`copilot`)
   - [OpenCode](https://opencode.ai) (`opencode`)
   - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
 
@@ -43,7 +44,26 @@ Agora does not talk to model APIs. Each agent is a real CLI that Agora runs the 
 
 If a CLI is installed but Agora says it is not found, it is not on the `PATH` the Python process sees. Paste the full path to its executable (for example `C:\Users\you\AppData\Roaming\npm\claude.cmd`) into that CLI's path box under Settings > CLIs and press Save. The path is kept in `agora_clis.json` next to the script.
 
+Press **Test** on a CLI's card to have Agora ask it one tiny read-only question exactly the way a seat would. A failure shows the CLI's last lines and, for login problems, what to do.
+
 Agora never installs, updates, or logs in to a CLI for you.
+
+### What Agora does so the CLIs behave
+
+Each agent is started with the user's own environment, adjusted in a few ways that matter in practice:
+
+- **Claude Code seats start one at a time.** Claude Code keeps one login token per machine and rotates it on refresh. When several copies start at the same moment and the token has expired, only one refresh succeeds and the others report an OAuth failure and ask for `/login`. Agora holds a gate from launch until each Claude seat has authenticated and produced its first line, then starts the next. A seat that still hits a login error waits five seconds and retries once, because the refreshed token is on disk by then.
+- **No nested-session markers.** If Agora itself was started from inside a Claude Code session, the `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` variables it inherits would make every Claude seat hang at startup. Agora removes them for its agents.
+- **The usual install folders are on `PATH`.** On macOS, a Python started from Finder or a bare shell does not see `~/.local/bin`, `/opt/homebrew/bin`, or nvm's node folder. Agora appends those when they exist, for both finding the CLIs and running them.
+- **No colour codes, no stdin, no auto-update.** Agents get `NO_COLOR=1`, an empty stdin so nothing waits for a keypress, and Claude's auto-updater off so twenty seats do not all try to update at once.
+
+Things Agora cannot fix, which Settings > CLIs warns about when it sees them:
+
+- `ANTHROPIC_API_KEY` in the environment: in non-interactive mode Claude Code always uses it instead of your login. Unset it before starting Agora if you want the login.
+- Agora started over SSH on a Mac: Claude Code's login lives in the macOS Keychain, which is locked for SSH sessions. Start Agora from a terminal on the Mac.
+- `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`: Claude Code talks to that endpoint or cloud instead.
+
+Copilot CLI authenticates from the login saved by `copilot login`, or from `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` if one is set. Read-only seats run it without tool permissions, which still allows reading and searching; full-access seats pass `--allow-all-tools`. Its model list in Agora is just `auto`, which lets Copilot choose: which named models an account may pass to `--model` varies by plan, so if you want a specific one, type its ID in the seat's Custom box and press Test on the Copilot card to confirm it is accepted.
 
 Flags:
 
@@ -133,7 +153,7 @@ Codex refuses to run non-interactively in a folder it has not been told to trust
 A few defaults live at the top of `agora.py`:
 
 - `DEFAULT_REPO`: the folder new conversations start in. Change it to your own project, or just pick a folder in the dashboard.
-- `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here. Any seat can also use a custom model name typed in the UI.
+- `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here. Any seat can also use a custom model name typed in the UI. A provider with `"gate": True` starts one process at a time.
 - `TURN_TIMEOUT`: how long one agent may take per turn, in seconds.
 - `FRAMING`, `OPENING`, `REPLY`, `OPEN_*`, `VOTE`: the council prompts.
 - `GAME_FRAMING`, `WORLD_STANCE`, `GAME_OPENING`, `GAME_REPLY`, `GAME_VOTE`: the game prompts.
