@@ -13,7 +13,7 @@ Agora can also run as a game instead of a council: characters with fixed stats, 
 Requirements:
 
 - Python 3.10 or newer. Standard library only, nothing to `pip install`.
-- At least one provider CLI installed, on `PATH`, and logged in:
+- At least one agent CLI. Agora installs them and signs in to them from Settings, Connections, so they do not have to be set up first:
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
   - [Codex](https://github.com/openai/codex) (`codex`, or `npx` for the "Codex (latest)" seat)
   - [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli) (`copilot`)
@@ -28,49 +28,54 @@ python agora.py
 
 It opens `http://127.0.0.1:8765/?token=...` in your browser. Then:
 
-1. Decide where the agents sit. The default is **Nowhere in particular**: an empty folder Agora keeps for itself, always read-only, right for most councils and for every game. Choose **A folder I choose** when the conversation is about code the agents should read.
-2. Add seats, or start from a template. Each seat has a name, a provider, a model, an optional stance ("Skeptic", "Defender", a character sheet), and a color.
-3. Write the topic (the charge) and any extra instructions.
-4. Choose Council or Game, how they speak, and how many rounds or what limits.
-5. Open the floor.
+1. Open the gear, then Connections, and connect at least one CLI.
+2. Decide where the agents sit. The default is **Nowhere in particular**: an empty folder Agora keeps for itself, always read-only, right for most councils and for every game. Choose **A folder I choose** when the conversation is about code the agents should read.
+3. Press **Agents** and seat them. Each seat has a name, a CLI, a model, a colour, and an optional stance ("Skeptic", "Defender", a character sheet).
+4. Press **Topic** for the charge, Council or Game, how they speak, rounds or limits, where they sit, and templates.
+5. Press **Start**.
 
-## Connecting your CLIs
+## The screen
 
-Agora does not talk to model APIs. Each agent is a real CLI that Agora runs the way you would in a terminal, inside the folder you picked, so it uses whatever login and settings that CLI already has. To connect a CLI:
+The header holds the conversation and nothing else: the conversations toggle, the title, what is happening now, one button that reads Start, Pause, Resume or Continue depending on where the conversation is, then **Agents**, **Topic**, and **End** while it is running. Everything else lives behind the gear, in this order: Connections, Export, Phone, Display, and at the bottom, in red, Stop this conversation and Quit Agora.
 
-1. Install it (the install command for each one is shown under Settings > CLIs).
-2. Log in to it once in a normal terminal (`claude` then `/login`, `codex login`, `opencode auth login`, `gemini`).
-3. Open Agora. The top of the New conversation page shows which CLIs it found. Press **Connect or check CLIs** to see versions, install and login commands, and to check again after installing.
+Agents and Topic open as panels over the page. One opens at a time, Escape or the X closes it, and edits save as you type. On a phone the tabs at the bottom are Chat, Terminals, Conversations, and More, where More holds Agents, Topic, End, and everything from the gear.
 
-If a CLI is installed but Agora says it is not found, it is not on the `PATH` the Python process sees. Paste the full path to its executable (for example `C:\Users\you\AppData\Roaming\npm\claude.cmd`) into that CLI's path box under Settings > CLIs and press Save. The path is kept in `agora_clis.json` next to the script.
+## Connections
 
-Press **Test** on a CLI's card to have Agora ask it one tiny read-only question exactly the way a seat would. A failure shows the CLI's last lines and, for login problems, what to do.
+Every agent is a CLI you would otherwise run yourself, so Agora needs it installed and signed in. Settings, Connections has one row per CLI with its name, its version, and its state, taken from that CLI's own status command:
 
-Agora never installs, updates, or logs in to a CLI for you.
+| CLI | How Agora asks |
+| --- | --- |
+| Claude Code | `claude auth status` |
+| Codex | `codex login status` |
+| Codex (latest) | the same, since the npx seat shares `~/.codex/auth.json` |
+| OpenCode | `opencode auth list` |
+| Gemini CLI | `gemini auth status`, then the credentials in `~/.gemini` |
+| Copilot CLI | nothing, because it has no status command and keeps its token in the operating system credential store. The row stays amber until you press Check, which asks it one tiny question |
+
+Every installed CLI is checked when Agora starts, so the rows are already coloured when you open them. Green is connected, amber is checking or unknown, red says what is wrong.
+
+Each row offers only what it needs:
+
+- **Install**, when the CLI is missing. Claude Code and Codex use their vendors' own installers; the rest use npm into `agora_tools` beside the script, so nothing needs an administrator and nothing already on the machine is touched. The installer's output streams under the row. If Node.js is missing for an npm install, the row links to nodejs.org instead. Agora never reinstalls or updates a CLI that is already there.
+- **Sign in**, which opens a real terminal window with that CLI's own sign-in already running, the way you would run it yourself. The browser opens from there. Agora then asks the CLI every fifteen seconds for ten minutes and turns the row green by itself.
+- **API key**, for the CLIs that take one. It is masked, it sets that vendor's environment variable for the CLIs Agora starts, it lives in memory for this run only, and it is never written to disk. Codex has no key field on purpose: Agora drives Codex through the ChatGPT subscription sign-in.
+- **Already installed?**, for pasting the full path when a CLI exists but is not on `PATH`.
+
+Nothing is offered when a CLI is connected.
+
+Connection state appears in exactly one other place: pressing Start with a seat whose CLI is not connected does not start the conversation and puts a single line under the header naming the CLI, with a link into Connections.
 
 ### What Agora does so the CLIs behave
 
-Each agent is started with the user's own environment, adjusted in a few ways that matter in practice:
+Each agent is started with your own environment, adjusted in a few ways that matter in practice:
 
-- **Claude Code seats start one at a time.** Claude Code keeps one login token per machine and rotates it on refresh. When several copies start at the same moment and the token has expired, only one refresh succeeds and the others report an OAuth failure and ask for `/login`. Agora holds a gate from launch until each Claude seat has authenticated and produced its first line, then starts the next. A seat that still hits a login error waits five seconds and retries once, because the refreshed token is on disk by then.
+- **Claude Code seats start one at a time.** Claude Code keeps one login token per machine and rotates it on refresh, so several copies starting at the same moment log each other out. Agora holds a gate from launch until each Claude seat has authenticated, then starts the next.
 - **No nested-session markers.** If Agora itself was started from inside a Claude Code session, the `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` variables it inherits would make every Claude seat hang at startup. Agora removes them for its agents.
-- **The usual install folders are on `PATH`.** On macOS, a Python started from Finder or a bare shell does not see `~/.local/bin`, `/opt/homebrew/bin`, or nvm's node folder. Agora appends those when they exist, for both finding the CLIs and running them.
+- **The installers' folders are on `PATH`.** A CLI installed after Agora started is not on the PATH this process captured at launch, so Agora also looks in `~/.local/bin`, the npm prefix, Homebrew, nvm, volta, fnm, and its own `agora_tools`.
 - **No colour codes, no stdin, no auto-update.** Agents get `NO_COLOR=1`, an empty stdin so nothing waits for a keypress, and Claude's auto-updater off so twenty seats do not all try to update at once.
 
-Things Agora cannot fix, which Settings > CLIs warns about when it sees them:
-
-- `ANTHROPIC_API_KEY` in the environment: in non-interactive mode Claude Code always uses it instead of your login. Unset it before starting Agora if you want the login.
-- Agora started over SSH on a Mac: Claude Code's login lives in the macOS Keychain, which is locked for SSH sessions. Start Agora from a terminal on the Mac.
-- `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`: Claude Code talks to that endpoint or cloud instead.
-
-Copilot CLI authenticates from the login saved by `copilot login`, or from `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` if one is set. Read-only seats run it without tool permissions, which still allows reading and searching; full-access seats pass `--allow-all-tools`. Its model list in Agora is just `auto`, which lets Copilot choose: which named models an account may pass to `--model` varies by plan, so if you want a specific one, type its ID in the seat's Custom box and press Test on the Copilot card to confirm it is accepted.
-
-Flags:
-
-| Flag | Meaning |
-| --- | --- |
-| `--port N` | Serve on a different port (default 8765). |
-| `--local-only` | Bind to 127.0.0.1 only. By default Agora also listens on your LAN so you can follow along from a phone. |
+Things Agora cannot fix, which the Connections rows warn about when they are true: `ANTHROPIC_API_KEY` in the environment, which Claude Code always prefers over your login in non-interactive mode; Agora started over SSH on a Mac, where the Keychain holding the Claude login is locked; and `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX`, which send Claude somewhere else entirely.
 
 ## How a conversation works
 
@@ -150,7 +155,16 @@ Everything is stored in `agora_telegram.json` next to the script (the file `agor
 
 ## Codex notes
 
-Codex refuses to run non-interactively in a folder it has not been told to trust. When a Codex seat is present, Agora adds the working folder to `~/.codex/config.toml` as trusted (a backup of the file is saved alongside) and records a note in the chat. Codex is also run with `--skip-git-repo-check` so folders that are not git repositories work.
+**Trust.** Codex refuses to run non-interactively in a folder it has not been told to trust. When a Codex seat is present, Agora adds the working folder to `~/.codex/config.toml` as trusted (a backup of the file is saved alongside) and records a note in the chat. Codex is also run with `--skip-git-repo-check` so folders that are not git repositories work.
+
+**Rotating tokens.** Codex refresh tokens rotate: the moment one process refreshes, the token every other process holds is dead. Several Codex seats starting at once therefore race, all but one lose with a 401, and a losing writer can leave `~/.codex/auth.json` half written. Agora avoids the race rather than retrying through it.
+
+- Before any turn or open-floor batch that includes Codex seats, one short priming prompt runs through Codex alone, so exactly one process performs the refresh. The credentials it leaves behind are copied to `agora_codex_auth.bak` beside the script.
+- If a Codex seat is refused as signed out anyway, the conversation pauses at once, the copy goes back, the priming prompt runs again, and the conversation resumes by itself if that worked.
+- If it did not work, the conversation stays paused and says so: "Codex signed out, sign in and press Resume", with a link into Connections. Pressing Resume primes again before carrying on.
+- One conversation uses one Codex install. If seats mix the pinned global `codex` with the npx latest, Agora moves them all onto one at Start and records a note, because two programs sharing one rotating token is the same race again.
+
+Seats still run fully in parallel. Only the priming prompt runs on its own.
 
 ## Configuration in the source
 
@@ -165,7 +179,7 @@ A few defaults live at the top of `agora.py`:
 
 ## Files not committed
 
-`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, the empty room, and all saved conversations and run output. Those stay on your machine.
+`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, the empty room, the CLIs Agora installs into `agora_tools`, the Codex credential copy, and all saved conversations and run output. Those stay on your machine.
 
 ## License
 
