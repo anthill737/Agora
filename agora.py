@@ -60,16 +60,16 @@ PROVIDERS = {
     },
     "Codex (latest)": {
         "exe": "npx", "speech": "stdout", "pkg": "@openai/codex", "isolated": True,
-        "cmd": 'npx -y @openai/codex@latest exec --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
-        "ro_cmd": 'npx -y @openai/codex@latest exec --model {model} --sandbox read-only "{ask}"',
+        "cmd": 'npx -y @openai/codex@latest exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
+        "ro_cmd": 'npx -y @openai/codex@latest exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
         "resume": "",
         "models": ["gpt-6-astra", "gpt-6-astra-pro", "gpt-5.6", "gpt-5.5"],
     },
     "Codex": {
         "exe": "codex", "speech": "stdout", "pkg": "@openai/codex",
-        "cmd": 'codex exec --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
+        "cmd": 'codex exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
         "resume": "",
-        "ro_cmd": 'codex exec --model {model} --sandbox read-only "{ask}"',
+        "ro_cmd": 'codex exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
         "models": ["gpt-6-astra", "gpt-6-astra-pro", "gpt-5.6", "gpt-5.5"],
     },
     "OpenCode": {
@@ -146,6 +146,43 @@ OPEN_ADDRESSED = """You were addressed by name in the messages above, so you
 must answer, briefly and directly, before anything else. Then add one new
 point only if it earns its place. Address people with @Name."""
 
+GAME_FRAMING = """You are a character in a living arena shared with other characters,
+each played by a different AI in its own process. You are not an assistant
+and you are not a judge; you are one person trying to survive and prosper.
+
+Hard rules: you have fixed stats given below and you cannot change them by
+saying so. Only the World can change any number, and it does so by announcing
+results. Words persuade other characters; words never resolve an action. To
+act, end your message with exactly one line in this form:
+ACTION: <what you do>    for example   ACTION: train strength   or
+ACTION: attack Vex   or   ACTION: offer Mira 3 gold for her map   or
+ACTION: rest
+You may also speak, plot, lie, threaten, bargain, or ally in the text above
+that line. Stay in character. Address others with @Name. Keep it short: a
+few sentences and one action. Never write for the World. Never describe the
+outcome of your own action; the World announces outcomes. Do not read or
+modify any files."""
+
+WORLD_STANCE = ("You are the World, the referee, not a player. You never take actions. Each turn you resolve every "
+    "pending ACTION line against the characters' current stats using fair dice you describe briefly, apply the results, "
+    "narrate what happened in two or three sentences, and then end your message with a table titled STANDINGS listing "
+    "every living character with health, gold, and skills, plus a DEAD list. Trades need both sides to have offered; "
+    "attacks compare strength plus a roll against the defender's health; training raises a skill by one at the cost of "
+    "the turn; rest restores health. Characters cannot change their own numbers no matter what they claim. When a "
+    "character reaches zero health it is dead and you say so. Be consistent with your last STANDINGS table; it is the "
+    "only source of truth.")
+
+GAME_OPENING = """The arena opens. Introduce yourself in character in two or
+three sentences, then take your first action."""
+
+GAME_REPLY = """Respond in character to what just happened and to anyone who
+addressed you, then take one action. If you truly have nothing to do this
+turn, your action is ACTION: rest."""
+
+GAME_VOTE = """The arena closes. In character, give your final words in two or
+three sentences: what you did, who you trust, who wronged you, and what you
+would do next. No action line."""
+
 VOTE = """Closing statement. The five most valuable concrete conclusions or
 changes, ranked, one sentence each with the file it touches where relevant.
 A plain list is allowed here only. Then stop."""
@@ -192,7 +229,8 @@ CL, CX = "Claude Code", "Codex (latest)"
 CLM, CXM = "claude-fable-5-1", "gpt-6-astra"
 
 
-PALETTE = ["#22D3EE", "#F59E0B", "#A78BFA", "#34D399", "#F472B6", "#60A5FA", "#FB7185", "#FACC15", "#2DD4BF", "#C084FC"]
+PALETTE = ["#22D3EE", "#F59E0B", "#A78BFA", "#34D399", "#F472B6", "#60A5FA", "#FB7185", "#FACC15", "#2DD4BF", "#C084FC",
+           "#4ADE80", "#F97316", "#38BDF8", "#E879F9", "#A3E635", "#FB923C", "#818CF8", "#F43F5E", "#14B8A6", "#EAB308", "#94A3B8"]
 
 
 def _seat(name: str, prov: str, stance: str = "") -> dict:
@@ -242,6 +280,30 @@ TEMPLATES: dict[str, list[dict]] = {
         _seat("Economist", CL, "Cost in tokens, time, and complexity."),
         _seat("Judge", CX, "Neutral. Summarize agreement and disagreement, force decisions."),
     ],
+    # a game, not a council: 20 characters plus the World as referee, on cheap models
+    "Arena (20 characters + World)": [_seat("World", CL, WORLD_STANCE)] + [
+        _seat(n, CL if i % 2 == 0 else CX, st) for i, (n, st) in enumerate([
+            ("Vex", "Strength 7, Speed 4, Health 12, Gold 3. Skills: none. Hot-tempered mercenary who trusts nobody and wants to be feared."),
+            ("Mira", "Strength 3, Speed 8, Health 9, Gold 6. Skills: none. Quick thief who would rather trade than fight and keeps a mental list of debts."),
+            ("Orrin", "Strength 5, Speed 5, Health 11, Gold 4. Skills: none. Steady farmer's son who wants to go home rich and alive."),
+            ("Sable", "Strength 4, Speed 6, Health 10, Gold 8. Skills: none. Smooth-talking merchant who believes every fight is a failed negotiation."),
+            ("Bram", "Strength 8, Speed 3, Health 13, Gold 2. Skills: none. Slow, loyal, easily flattered; will die for a friend."),
+            ("Ilse", "Strength 4, Speed 7, Health 9, Gold 5. Skills: none. Cold strategist who wants to run the arena by the end."),
+            ("Tomas", "Strength 6, Speed 4, Health 10, Gold 4. Skills: none. Cheerful brawler who forgives too easily."),
+            ("Neri", "Strength 3, Speed 9, Health 8, Gold 7. Skills: none. Paranoid scout who sleeps with one eye open and hoards information."),
+            ("Kade", "Strength 7, Speed 5, Health 11, Gold 3. Skills: none. Ambitious, wants glory more than gold, respects strength."),
+            ("Wren", "Strength 2, Speed 8, Health 8, Gold 9. Skills: none. Frail, rich, and clever; buys protection and remembers who took the coin."),
+            ("Dagny", "Strength 6, Speed 6, Health 10, Gold 4. Skills: none. Fair-minded, hates cheats, will punish a liar even at a loss."),
+            ("Pell", "Strength 5, Speed 5, Health 10, Gold 5. Skills: none. Average in everything and knows it; survives by being useful."),
+            ("Juno", "Strength 4, Speed 7, Health 9, Gold 6. Skills: none. Charming liar who wants everyone to like her right up until it costs them."),
+            ("Halvard", "Strength 9, Speed 2, Health 14, Gold 1. Skills: none. Huge, slow, proud, and broke; will not beg."),
+            ("Tess", "Strength 5, Speed 6, Health 10, Gold 5. Skills: none. Curious tinkerer who trains constantly and avoids fights until ready."),
+            ("Rook", "Strength 6, Speed 5, Health 11, Gold 3. Skills: none. Quiet watcher who acts once, decisively, when it matters."),
+            ("Amara", "Strength 4, Speed 6, Health 10, Gold 7. Skills: none. Healer's apprentice; wants allies, offers rest and trade, fears blood."),
+            ("Gus", "Strength 7, Speed 3, Health 12, Gold 2. Skills: none. Loud, greedy, cowardly when hurt, brave when winning."),
+            ("Lio", "Strength 3, Speed 8, Health 9, Gold 5. Skills: none. Young, fast, reckless, wants a story worth telling."),
+            ("Petra", "Strength 6, Speed 5, Health 11, Gold 4. Skills: none. Grudge-holder with a long memory and a longer plan."),
+        ])],
     # names only, no stances
     "Blank: 2 agents": [_seat("Claude", CL), _seat("Codex", CX)],
     "Blank: 4 agents": [_seat("Claude A", CL), _seat("Codex A", CX), _seat("Claude B", CL), _seat("Codex B", CX)],
@@ -249,6 +311,45 @@ TEMPLATES: dict[str, list[dict]] = {
     "Blank: 8 agents": [_seat(f"Claude {c}", CL) if i % 2 == 0 else _seat(f"Codex {c}", CX) for i, c in enumerate("AABBCCDD")],
     "Blank: 5 Claude + 5 Codex": [_seat(f"Claude {n}", CL) for n in "12345"] + [_seat(f"Codex {n}", CX) for n in "12345"],
 }
+
+# ---------------------------------------------------------------- user templates
+USER_TEMPLATES_FILE = HERE.with_name("agora_templates.json")
+
+
+def user_templates() -> dict:
+    try: return json.loads(USER_TEMPLATES_FILE.read_text(encoding="utf-8")) if USER_TEMPLATES_FILE.exists() else {}
+    except Exception: return {}
+
+
+def save_user_template(name: str, data: dict) -> None:
+    t = user_templates(); t[name] = data
+    USER_TEMPLATES_FILE.write_text(json.dumps(t, indent=1), encoding="utf-8")
+
+
+def delete_user_template(name: str) -> None:
+    t = user_templates(); t.pop(name, None)
+    USER_TEMPLATES_FILE.write_text(json.dumps(t, indent=1), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- codex trust
+def ensure_codex_trust(folder: str) -> str | None:
+    """Codex's non-interactive mode refuses folders not marked trusted in ~/.codex/config.toml.
+    Add the entry if missing. Returns a note if something was changed, else None."""
+    try:
+        cfg = Path.home() / ".codex" / "config.toml"
+        cfg.parent.mkdir(exist_ok=True)
+        text = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
+        key = str(Path(folder).resolve())
+        variants = {key, key.replace("\\", "/"), key.replace("\\", "\\\\")}
+        if any(f'[projects."{v}"]' in text or f"[projects.'{v}']" in text for v in variants): return None
+        if cfg.exists(): cfg.with_suffix(".toml.agora-backup").write_text(text, encoding="utf-8")
+        esc = key.replace("\\", "\\\\")
+        with cfg.open("a", encoding="utf-8") as fh:
+            fh.write(f'\n[projects."{esc}"]\ntrust_level = "trusted"\n')
+        return f"Marked {key} as trusted for Codex in {cfg} (backup saved alongside)."
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not update Codex trust config: {type(exc).__name__}"
+
 
 # ---------------------------------------------------------------- versions
 VERSIONS: dict[str, dict] = {}     # provider -> {"installed": str, "latest": str}
@@ -312,7 +413,10 @@ def tg_send(text: str) -> str:
 
 
 # ---------------------------------------------------------------- sessions
-def now_id() -> str: return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+def now_id() -> str:
+    base = dt.datetime.now().strftime("%Y%m%d-%H%M%S"); sid = base; n = 2
+    while (SESSIONS / sid).exists(): sid = f"{base}-{n}"; n += 1
+    return sid
 
 
 class Session:
@@ -332,6 +436,10 @@ class Session:
         self.topic = d.get("topic", DEFAULT_TOPIC); self.extra = d.get("extra", "")
         self.rounds = d.get("rounds", 3); self.readonly = d.get("readonly", True)
         self.mode = d.get("mode", "turns")   # turns | open
+        self.framing = d.get("framing", "council")   # council | game
+        self.max_messages = int(d.get("max_messages") or 0)   # 0 = no limit (open floor)
+        self.max_minutes = int(d.get("max_minutes") or 0)     # 0 = no limit (open floor)
+        self.started_at = d.get("started_at", 0.0)
         self.transcript = d.get("transcript", []); self.turn = d.get("turn", 0)
         self.status = d.get("status", "idle")
         if self.status in ("running", "voting"): self.status = "paused"
@@ -343,6 +451,7 @@ class Session:
     def to_dict(self) -> dict:
         return {"title": self.title, "created": self.created, "repo": self.repo, "seats": self.seats,
                 "topic": self.topic, "extra": self.extra, "rounds": self.rounds, "readonly": self.readonly, "mode": self.mode,
+                "max_messages": self.max_messages, "max_minutes": self.max_minutes, "started_at": self.started_at, "framing": self.framing,
                 "transcript": self.transcript, "turn": self.turn, "status": self.status,
                 "rounds_done": self.rounds_done, "skipped": self.skipped,
                 "cli_sessions": self.cli_sessions, "last_seen": self.last_seen}
@@ -360,6 +469,20 @@ class Session:
         if not f.exists(): return None
         try: return cls(sid, json.loads(f.read_text(encoding="utf-8")))
         except Exception: return None
+
+    def export_md(self, what: str = "all") -> str:
+        """Markdown export. what: all | closing | speeches (no live-terminal noise, no system notes)."""
+        keep = {"all": None, "closing": {"resolution"}, "speeches": {"speech", "resolution", "convener"}}.get(what)
+        md = [f"# {self.title or 'Conversation'}", f"Created: {self.created}  ", f"Mode: {'open floor' if self.mode == 'open' else 'take turns'}  ", f"Folder: {self.repo}", "",
+              "## Agents", ""] + [f"- **{s['name']}** ({s['provider']}, {s['model']})" + (f": {s['stance']}" if s.get('stance') else "") for s in self.seats]
+        md += ["", "## Topic", "", self.topic, ""]
+        if self.extra.strip(): md += ["## Extra instructions", "", self.extra, ""]
+        md += ["## " + {"closing": "Closing statements", "speeches": "Conversation", "all": "Full record"}.get(what, "Full record"), ""]
+        for e in self.transcript:
+            if keep is not None and e["kind"] not in keep: continue
+            tag = {"resolution": " (closing statement)", "convener": " (convener)", "system": " (Agora)"}.get(e["kind"], "")
+            md += [f"### {e['speaker']}{tag}  ", f"*turn {e['turn']} · {e['time']}*", "", e["text"], ""]
+        return "\n".join(md)
 
     def seat_dir(self, i: int) -> Path:
         d = self.dir / f"agent{i + 1}"; d.mkdir(exist_ok=True)
@@ -385,103 +508,28 @@ def list_sessions() -> list[dict]:
 
 
 # ---------------------------------------------------------------- engine
-class Agora:
-    def __init__(self) -> None:
-        SESSIONS.mkdir(exist_ok=True)
+class Run:
+    """The engine for one conversation: its own agents, terminals, processes, flags, and thread."""
+
+    def __init__(self, session: "Session", agora: "Agora") -> None:
+        self.s = session; self.agora = agora
         self.lock = threading.Lock()
-        self.s: Session = self._open_latest()
         self.terms: list[dict] = []
         self.current: str | None = None
         self.procs: dict[int, subprocess.Popen] = {}
         self.speaking: set[int] = set()
         self.thread: threading.Thread | None = None
         self.stop_flag, self.pause_flag, self.vote_flag = threading.Event(), threading.Event(), threading.Event()
-        self.phone_url = ""; self.away_url = ""; self.last_tg = ""
-        self._reset_terms(); refresh_versions()
-
-    def _open_latest(self) -> Session:
-        for meta in list_sessions():
-            sess = Session.load(meta["id"])
-            if sess: return sess
-        return Session(now_id())
+        self._reset_terms()
 
     def _reset_terms(self) -> None:
         self.terms = [{"lines": collections.deque(maxlen=TAIL), "state": "waiting", "count": 0} for _ in self.s.seats]
 
+
     def busy(self) -> bool: return self.s.status in ("running", "voting")
 
-    # ---- state for the UI
-    def snapshot(self) -> dict:
-        with self.lock:
-            s = self.s
-            return {"id": s.id, "title": s.title, "seats": s.seats, "topic": s.topic, "extra": s.extra,
-                    "rounds": s.rounds, "readonly": s.readonly, "mode": s.mode, "transcript": s.transcript, "status": s.status,
-                    "current": self.current, "turn": s.turn, "repo": s.repo, "repo_ok": Path(s.repo).is_dir(),
-                    "rounds_done": s.rounds_done, "sessions": list_sessions(),
-                    "terms": [{"state": t["state"], "count": t["count"], "lines": list(t["lines"])} for t in self.terms],
-                    "phone_url": self.phone_url, "away_url": self.away_url, "last_tg": self.last_tg,
-                    "tg_ready": bool((tg_config().get("token") or "").strip()),
-                    "templates": list(TEMPLATES.keys()), "sessions_dir": str(SESSIONS),
-                    "providers": {k: {"models": v["models"], "installed": shutil.which(v["exe"]) is not None,
-                                      "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
-                                      "version": VERSIONS.get(k, {}).get("installed", ""), "latest": VERSIONS.get(k, {}).get("latest", "")}
-                                  for k, v in PROVIDERS.items()}}
 
-    # ---- session management
-    def new_session(self) -> None:
-        with self.lock:
-            if self.busy(): return
-            self.s = Session(now_id()); self.s.save(); self._reset_terms(); self.current = None
 
-    def open_session(self, sid: str) -> None:
-        with self.lock:
-            if self.busy(): return
-            sess = Session.load(sid)
-            if sess: self.s = sess; self._reset_terms(); self.current = None
-
-    def delete_session(self, sid: str) -> None:
-        with self.lock:
-            if self.busy() and sid == self.s.id: return
-            shutil.rmtree(SESSIONS / sid, ignore_errors=True)
-            if sid == self.s.id: self.s = self._open_latest(); self._reset_terms()
-
-    def apply_template(self, name: str) -> None:
-        with self.lock:
-            if self.busy() or self.s.transcript or name not in TEMPLATES: return
-            self.s.seats = color_seats([dict(x) for x in TEMPLATES[name]]); self.s.skipped = [False] * len(self.s.seats)
-            self._reset_terms(); self.s.save()
-
-    def configure(self, d: dict) -> None:
-        with self.lock:
-            s = self.s
-            if self.busy():
-                d = {k: v for k, v in d.items() if k in ("seats", "extra")}
-                if "seats" in d and len(d["seats"]) != len(s.seats): return
-            if "seats" in d:
-                seats = []
-                for x in d["seats"]:
-                    if x.get("provider") in PROVIDERS and x.get("model"):
-                        seats.append({"name": (x.get("name") or "").strip(), "provider": x["provider"], "model": x["model"].strip(), "stance": (x.get("stance") or "").strip(), "color": (x.get("color") or "").strip()})
-                color_seats(seats)
-                if not s.transcript and not self.busy():  # before the first turn anything goes
-                    s.seats = seats; s.skipped = [False] * len(seats); self._reset_terms()
-                elif len(seats) == len(s.seats):  # mid-conversation: names fixed, engine swappable
-                    for i, (old, new) in enumerate(zip(s.seats, seats)):
-                        if (old["provider"], old["model"]) != (new["provider"], new["model"]):
-                            s.cli_sessions.pop(str(i), None)
-                            with (s.seat_dir(i) / "memory.md").open("a", encoding="utf-8") as fh:
-                                fh.write(f"\n(Note: from here on you are running as {new['provider']} with model {new['model']}; the earlier turns above were yours under {old['provider']} {old['model']}.)\n")
-                        old["provider"], old["model"], old["stance"], old["color"] = new["provider"], new["model"], new["stance"], new.get("color") or old.get("color")
-            for k in ("topic", "extra", "title"):
-                if k in d: setattr(s, k, d[k])
-            if "rounds" in d: s.rounds = max(1, int(d["rounds"]))
-            if "readonly" in d: s.readonly = bool(d["readonly"])
-            if d.get("mode") in ("turns", "open"): s.mode = d["mode"]
-            if d.get("repo"): s.repo = d["repo"]
-            if not s.title: s.title = " ".join(s.topic.split()[:8])
-            s.save()
-
-    # ---- controls
     def start(self) -> None:
         with self.lock:
             s = self.s
@@ -489,16 +537,22 @@ class Agora:
             if s.status == "paused" and self.thread and self.thread.is_alive():
                 self.pause_flag.clear(); s.status = "running"; s.save(); return
             if s.status == "done": s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(s.seats))
+            if s.status in ("done", "stopped"): s.skipped = [False] * len(s.seats)   # benched seats get another chance on Continue
             for f in (self.stop_flag, self.pause_flag, self.vote_flag): f.clear()
             if not s.title: s.title = " ".join(s.topic.split()[:8])
-            s.status = "running"; s.save()
+            s.status = "running"; s.started_at = time.time(); s.save()
             for i in range(len(s.seats)): s.seat_dir(i)   # memory files exist before anyone speaks
+            if any(PROVIDERS[x["provider"]]["exe"] in ("codex", "npx") for x in s.seats):
+                note = ensure_codex_trust(s.repo)
+                if note: self._record("Agora", note, "system")
             if not self.terms: self._reset_terms()
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+
 
     def pause(self) -> None:
         with self.lock:
             if self.s.status == "running": self.pause_flag.set(); self.s.status = "paused"; self.s.save()
+
 
     def _kill_tree(self) -> None:
         for p in list(self.procs.values()):
@@ -510,29 +564,23 @@ class Agora:
                 try: p.kill()
                 except Exception: pass
 
+
     def stop(self) -> None:
         self.stop_flag.set(); self.pause_flag.clear(); self._kill_tree()
         with self.lock:
             for t in self.terms: t["state"] = "waiting"
 
-    def shutdown(self) -> None:
-        self.stop(); threading.Timer(0.8, lambda: os._exit(0)).start()
 
     def call_vote(self) -> None: self.vote_flag.set(); self.pause_flag.clear()
 
-    def send_link(self) -> str:
-        link = self.away_url or self.phone_url
-        if not link: return "No reachable link to send (started with --local-only, or no network address)."
-        msg = f"Agora is running.\nOpen on your phone: {link}"
-        if self.away_url and self.phone_url and self.away_url != self.phone_url: msg += f"\nHome wifi only: {self.phone_url}"
-        self.last_tg = tg_send(msg); return self.last_tg
 
     def _notify_finished(self) -> None:
         cfg = tg_config()
         if not cfg.get("notify_on_finish", True) or not (cfg.get("token") or "").strip(): return
-        link = self.away_url or self.phone_url or ""
+        link = self.agora.away_url or self.agora.phone_url or ""
         n = sum(1 for e in self.s.transcript if e["kind"] == "speech")
         threading.Thread(target=tg_send, args=(f"Agora: '{self.s.title or 'conversation'}' finished with {n} messages and closing statements.\n{link}",), daemon=True).start()
+
 
     def say(self, text: str, target: str = "") -> None:
         text = (text or "").strip()
@@ -540,12 +588,14 @@ class Agora:
         if target: text = f"To {target}: {text}"
         self._record("Anthony", text, "convener")
 
-    # ---- internals
+
+
     def _term(self, i: int, text: str) -> None:
         with self.lock:
             if i >= len(self.terms): return
             for ln in text.split("\n"):
                 self.terms[i]["lines"].append(ln); self.terms[i]["count"] += 1
+
 
     def _record(self, speaker: str, text: str, kind: str) -> None:
         with self.lock:
@@ -559,13 +609,19 @@ class Agora:
                     fh.write(f"\n## Turn {e['turn']} ({e['time']}), {line}:\n{text}\n")
             s.save()
 
+
     def _prompt(self, i: int, seat: dict, instruction: str) -> str:
         s = self.s; me = s.label(seat)
         others = ", ".join(f"{s.label(x)} ({x['provider']}, {x['model']})" for x in s.seats if x is not seat)
-        parts = [FRAMING, f"\nTopic:\n{s.topic}\n"]
+        game = s.framing == "game"
+        parts = [GAME_FRAMING if game else FRAMING, f"\n{'The arena and its rules' if game else 'Topic'}:\n{s.topic}\n"]
         if s.extra.strip(): parts.append(f"Additional instructions from the convener:\n{s.extra}\n")
-        parts.append(f"You are {me}, running as {seat['provider']} with model {seat['model']}. The others: {others}.\n")
-        if seat.get("stance"): parts.append(f"Your assigned stance or role: {seat['stance']}\n")
+        if game:
+            parts.append(f"You are {me}. The other characters: {', '.join(s.label(x) for x in s.seats if x is not seat)}.\n")
+            if seat.get("stance"): parts.append(f"Your character sheet: {seat['stance']}\n")
+        else:
+            parts.append(f"You are {me}, running as {seat['provider']} with model {seat['model']}. The others: {others}.\n")
+            if seat.get("stance"): parts.append(f"Your assigned stance or role: {seat['stance']}\n")
         parts.append(f"Your memory file (yours alone, full history of this conversation): {s.seat_dir(i) / 'memory.md'}\n")
         seen = int(s.last_seen.get(str(i), 0)); new = s.transcript[seen:]
         if new:
@@ -575,6 +631,7 @@ class Agora:
         parts.append(f"Your instruction now:\n{instruction}")
         return "\n".join(parts)
 
+
     def _command(self, i: int, seat: dict, prompt_file: Path) -> str:
         s = self.s; prov = PROVIDERS[seat["provider"]]
         cmd = prov["ro_cmd" if s.readonly else "cmd"].format(ask=ASK.format(prompt_file=prompt_file), model=seat["model"])
@@ -582,9 +639,11 @@ class Agora:
         if sid and prov.get("resume"): cmd += prov["resume"].format(sid=sid)
         return cmd
 
+
     def _set_current(self) -> None:
         names = [self.s.label(self.s.seats[j]) for j in sorted(self.speaking) if j < len(self.s.seats)]
         self.current = ", ".join(names) if names else None
+
 
     def _speak(self, i: int, seat: dict, instruction: str) -> str:
         s = self.s; who = s.label(seat); prov = PROVIDERS[seat["provider"]]
@@ -634,6 +693,7 @@ class Agora:
         if s.cli_sessions.pop(str(i), None): detail += "\n(dropped this agent's resumable CLI session; it will start fresh next turn)"
         return f"[{who} returned no answer. Last output from its terminal:]\n{detail}"
 
+
     def _run_open(self) -> None:
         """Open floor: after any message, every other agent may reply or pass, up to MAX_PARALLEL at once."""
         import re
@@ -641,6 +701,7 @@ class Agora:
         MAX_PARALLEL = n            # no limit: everyone may compose at once
         cap = float("inf")          # no message cap; the floor closes when everyone passes
         queue: dict[int, str] = {}           # seat -> instruction kind: "open" | "addressed"
+        failures: dict[int, int] = {}        # seat -> consecutive failed runs
         passed_on: dict[int, int] = {}       # seat -> transcript length it passed on
         last_speaker: int | None = None
         threads: dict[int, threading.Thread] = {}
@@ -657,8 +718,9 @@ class Agora:
 
         def worker(i: int, kind: str) -> None:
             seat = seats[i]
-            first = spoken[i] == 0 and not any(e["kind"] == "speech" for e in s.transcript)
-            instr = OPEN_OPENING if first else (OPEN_ADDRESSED if kind == "addressed" else OPEN_REPLY)
+            first = spoken[i] == 0 and (s.framing == "game" or not any(e["kind"] == "speech" for e in s.transcript))
+            if s.framing == "game": instr = GAME_OPENING if first else GAME_REPLY
+            else: instr = OPEN_OPENING if first else (OPEN_ADDRESSED if kind == "addressed" else OPEN_REPLY)
             s.last_seen[str(i)] = prompted_at[i]
             text = self._speak(i, seat, instr)
             nonlocal last_speaker
@@ -666,17 +728,33 @@ class Agora:
                 passed_on[i] = len(s.transcript); self._term(i, "(passed)")
                 return
             if text.startswith("[") and "returned no answer" in text:
-                passed_on[i] = len(s.transcript); return
+                failures[i] = failures.get(i, 0) + 1; passed_on[i] = len(s.transcript)
+                if failures[i] == 1: self._record("Agora", text, "system")
+                if failures[i] >= 2 and not s.skipped[i]:
+                    s.skipped[i] = True; self._record("Agora", f"{s.label(seat)} failed twice in a row and is benched for the rest of this conversation. Fix its provider or model in Details; it rejoins on Continue.", "system")
+                return
+            failures[i] = 0
             self._record(s.label(seat), text, "speech"); spoken[i] += 1; last_speaker = i
+            if closed["v"]: return
             with self.lock:
                 for j in range(n):
                     if j != i and not s.skipped[j]: queue[j] = "addressed" if j in mentioned(text) else queue.get(j, "open")
                 for j in mentioned(text):
                     if j != i: queue[j] = "addressed"
 
-        seen_len = len(s.transcript)
+        seen_len = len(s.transcript); closed = {"v": False}
         while not self.stop_flag.is_set() and not self.vote_flag.is_set():
             while self.pause_flag.is_set() and not self.stop_flag.is_set(): time.sleep(0.5)
+            # auto-close limits (live-editable): stop launching, let composing agents finish
+            msgs = sum(1 for e in s.transcript if e["kind"] == "speech")
+            over_msgs = s.max_messages and msgs >= s.max_messages
+            over_time = s.max_minutes and (time.time() - (s.started_at or time.time())) >= s.max_minutes * 60
+            if over_msgs or over_time:
+                closed["v"] = True; queue.clear()
+                for i in [i for i, t in threads.items() if not t.is_alive()]: threads.pop(i)
+                if not threads:
+                    self._record("Agora", f"The floor is closed: {'message limit' if over_msgs else 'time limit'} reached.", "system"); break
+                time.sleep(0.5); continue
             # convener interjections wake everyone
             if len(s.transcript) != seen_len:
                 newest = s.transcript[-1]
@@ -708,6 +786,7 @@ class Agora:
             time.sleep(0.5)
         for t in list(threads.values()): t.join(timeout=TURN_TIMEOUT)
 
+
     def _run(self) -> None:
         s = self.s; seats = list(s.seats)
         missing = [f"{s.label(x)}: '{PROVIDERS[x['provider']]['exe']}' is not installed or not on PATH" for x in seats if shutil.which(PROVIDERS[x["provider"]]["exe"]) is None]
@@ -733,12 +812,13 @@ class Agora:
                     if s.label(s.seats[j]) != e["speaker"] and j not in pull: pull.append(j)
             seen_len = len(s.transcript)
             if pull:
-                i = pull.pop(0); instr = OPEN_ADDRESSED
+                i = pull.pop(0); instr = GAME_REPLY if s.framing == "game" else OPEN_ADDRESSED
             else:
                 i = rr % len(seats); rr += 1
                 if i == last_i and len(seats) > 1:  # rotation landed on whoever just spoke via a pull; skip ahead
                     i = rr % len(seats); rr += 1
-                instr = OPENING if not any(e["kind"] == "speech" for e in s.transcript) else REPLY
+                first_ever = not any(e["kind"] == "speech" for e in s.transcript)
+                instr = (GAME_OPENING if first_ever else GAME_REPLY) if s.framing == "game" else (OPENING if first_ever else REPLY)
             k += 1
             seat = s.seats[i]
             if s.skipped[i]: continue
@@ -758,12 +838,182 @@ class Agora:
                 seat = s.seats[i]
                 if self.stop_flag.is_set() or s.skipped[i]: continue
                 with self.lock: self.current = s.label(seat)
-                text = self._speak(i, seat, VOTE); s.last_seen[str(i)] = len(s.transcript)
+                text = self._speak(i, seat, GAME_VOTE if s.framing == "game" else VOTE); s.last_seen[str(i)] = len(s.transcript)
                 self._record(s.label(seat), text, "system" if (text.startswith("[") and "returned no answer" in text) else "resolution")
         with self.lock:
             self.current = None; s.status = "stopped" if self.stop_flag.is_set() else "done"
             s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(seats)); s.save()
         if s.status == "done": self._notify_finished()
+
+
+
+class Agora:
+    """Manages conversations. Every conversation has its own Run; any number may be live at once."""
+
+    def __init__(self) -> None:
+        SESSIONS.mkdir(exist_ok=True)
+        self.lock = threading.Lock()
+        self.runs: dict[str, Run] = {}
+        first = self._open_latest()
+        self.sid = first.id; self.runs[first.id] = Run(first, self)
+        self.phone_url = ""; self.away_url = ""; self.last_tg = ""
+        refresh_versions()
+
+    def _open_latest(self) -> Session:
+        for meta in list_sessions():
+            sess = Session.load(meta["id"])
+            if sess: return sess
+        return Session(now_id())
+
+    @property
+    def run(self) -> Run:
+        return self.runs[self.sid]
+
+    @property
+    def s(self) -> Session:
+        return self.run.s
+
+    def _get_run(self, sid: str) -> Run | None:
+        if sid in self.runs: return self.runs[sid]
+        sess = Session.load(sid)
+        if not sess: return None
+        self.runs[sid] = Run(sess, self); return self.runs[sid]
+
+    def busy(self) -> bool: return self.run.busy()
+
+    def snapshot(self) -> dict:
+        r = self.run
+        with r.lock:
+            s = r.s
+            live = [rid for rid, x in self.runs.items() if x.busy()]
+            return {"id": s.id, "title": s.title, "seats": s.seats, "topic": s.topic, "extra": s.extra,
+                    "rounds": s.rounds, "readonly": s.readonly, "mode": s.mode,
+                    "max_messages": s.max_messages, "max_minutes": s.max_minutes, "started_at": s.started_at, "framing": s.framing, "transcript": s.transcript, "status": s.status,
+                    "current": r.current, "turn": s.turn, "repo": s.repo, "repo_ok": Path(s.repo).is_dir(),
+                    "rounds_done": s.rounds_done, "sessions": list_sessions(), "live": live,
+                    "terms": [{"state": t["state"], "count": t["count"], "lines": list(t["lines"])} for t in r.terms],
+                    "phone_url": self.phone_url, "away_url": self.away_url, "last_tg": self.last_tg,
+                    "tg_ready": bool((tg_config().get("token") or "").strip()),
+                    "templates": list(TEMPLATES.keys()), "user_templates": list(user_templates().keys()), "sessions_dir": str(SESSIONS),
+                    "providers": {k: {"models": v["models"], "installed": shutil.which(v["exe"]) is not None,
+                                      "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
+                                      "version": VERSIONS.get(k, {}).get("installed", ""), "latest": VERSIONS.get(k, {}).get("latest", "")}
+                                  for k, v in PROVIDERS.items()}}
+
+    def new_session(self) -> None:
+        with self.lock:
+            sess = Session(now_id()); sess.save(); self.runs[sess.id] = Run(sess, self); self.sid = sess.id
+
+    def open_session(self, sid: str) -> None:
+        with self.lock:
+            if self._get_run(sid): self.sid = sid
+
+    def delete_session(self, sid: str) -> None:
+        with self.lock:
+            r = self.runs.get(sid)
+            if r and r.busy(): return
+            self.runs.pop(sid, None); shutil.rmtree(SESSIONS / sid, ignore_errors=True)
+            if sid == self.sid:
+                sess = self._open_latest(); self.runs.setdefault(sess.id, Run(sess, self)); self.sid = sess.id
+
+    def save_template(self, name: str) -> None:
+        name = (name or "").strip()
+        if not name: return
+        s = self.s
+        save_user_template(name, {"seats": [dict(x) for x in s.seats], "framing": s.framing, "mode": s.mode, "rounds": s.rounds,
+                                  "readonly": s.readonly, "topic": s.topic, "extra": s.extra, "repo": s.repo,
+                                  "max_messages": s.max_messages, "max_minutes": s.max_minutes})
+
+    def apply_template(self, name: str) -> None:
+        r = self.run
+        with r.lock:
+            if r.busy() or r.s.transcript: return
+            ut = user_templates()
+            if name in ut:   # a saved layout: restore everything
+                d = ut[name]; s = r.s
+                s.seats = color_seats([dict(x) for x in d.get("seats", [])]); s.skipped = [False] * len(s.seats)
+                for k in ("framing", "mode", "rounds", "readonly", "topic", "extra", "repo", "max_messages", "max_minutes"):
+                    if k in d: setattr(s, k, d[k])
+                r._reset_terms(); s.save(); return
+            if name not in TEMPLATES: return
+            seats = [dict(x) for x in TEMPLATES[name]]
+            if name.startswith("Arena"):
+                for x in seats: x["model"] = "claude-haiku-4-5" if x["provider"] == CL else "gpt-5.5"
+                r.s.framing = "game"; r.s.mode = "turns"; r.s.rounds = 6
+                r.s.topic = ("A walled arena with a market stall, a training yard, and a healer's tent. Twenty strangers, "
+                             "one season. Gold buys goods and favors, training raises skills, fights cost health, and the dead "
+                             "stay dead. Every six rounds the World holds a vote: the character the others trust least is exiled. "
+                             "Win by being alive, rich, or beloved when the season ends.")
+            else:
+                r.s.framing = "council"
+            r.s.seats = color_seats(seats); r.s.skipped = [False] * len(r.s.seats)
+            r._reset_terms(); r.s.save()
+
+
+    def configure(self, d: dict) -> None:
+        r = self.run
+        with r.lock:
+            s = r.s
+            if r.busy():
+                d = {k: v for k, v in d.items() if k in ("seats", "extra", "max_messages", "max_minutes")}
+                if "seats" in d and len(d["seats"]) != len(s.seats): return
+            if "seats" in d:
+                seats = []
+                for x in d["seats"]:
+                    if x.get("provider") in PROVIDERS and x.get("model"):
+                        seats.append({"name": (x.get("name") or "").strip(), "provider": x["provider"], "model": x["model"].strip(), "stance": (x.get("stance") or "").strip(), "color": (x.get("color") or "").strip()})
+                color_seats(seats)
+                if not s.transcript and not self.busy():  # before the first turn anything goes
+                    s.seats = seats; s.skipped = [False] * len(seats); r._reset_terms()
+                elif len(seats) == len(s.seats):  # mid-conversation: names fixed, engine swappable
+                    for i, (old, new) in enumerate(zip(s.seats, seats)):
+                        if (old["provider"], old["model"]) != (new["provider"], new["model"]):
+                            s.cli_sessions.pop(str(i), None)
+                            with (s.seat_dir(i) / "memory.md").open("a", encoding="utf-8") as fh:
+                                fh.write(f"\n(Note: from here on you are running as {new['provider']} with model {new['model']}; the earlier turns above were yours under {old['provider']} {old['model']}.)\n")
+                        old["provider"], old["model"], old["stance"], old["color"] = new["provider"], new["model"], new["stance"], new.get("color") or old.get("color")
+            for k in ("topic", "extra", "title"):
+                if k in d: setattr(s, k, d[k])
+            if "rounds" in d: s.rounds = max(1, int(d["rounds"]))
+            if "readonly" in d: s.readonly = bool(d["readonly"])
+            if d.get("mode") in ("turns", "open"): s.mode = d["mode"]
+            if d.get("framing") in ("council", "game"): s.framing = d["framing"]
+            if "max_messages" in d: s.max_messages = max(0, int(d["max_messages"] or 0))
+            if "max_minutes" in d: s.max_minutes = max(0, int(d["max_minutes"] or 0))
+            if d.get("repo"): s.repo = d["repo"]
+            if not s.title: s.title = " ".join(s.topic.split()[:8])
+            s.save()
+
+
+    def start(self) -> None: self.run.start()
+    def pause(self) -> None: self.run.pause()
+    def stop(self) -> None: self.run.stop()
+    def call_vote(self) -> None: self.run.call_vote()
+    def say(self, text: str, target: str = "") -> None: self.run.say(text, target)
+
+    def shutdown(self) -> None:
+        for r in list(self.runs.values()): r.stop()
+        def die() -> None:
+            if os.name == "nt":
+                # close the console window that launched us (cmd/PowerShell/the .bat), not just this process
+                try:
+                    ppid = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                           f"(Get-CimInstance Win32_Process -Filter 'ProcessId={os.getpid()}').ParentProcessId"],
+                                          capture_output=True, text=True, timeout=10).stdout.strip()
+                    if ppid.isdigit():
+                        subprocess.Popen(["cmd", "/c", f"timeout /t 1 /nobreak >nul & taskkill /PID {ppid} /T /F"],
+                                         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0))
+                except Exception: pass
+            os._exit(0)
+        threading.Timer(0.8, die).start()
+
+
+    def send_link(self) -> str:
+        link = self.away_url or self.phone_url
+        if not link: return "No reachable link to send (started with --local-only, or no network address)."
+        msg = f"Agora is running.\nOpen on your phone: {link}"
+        if self.away_url and self.phone_url and self.away_url != self.phone_url: msg += f"\nHome wifi only: {self.phone_url}"
+        self.last_tg = tg_send(msg); return self.last_tg
 
 
 def list_dir(path: str) -> dict:
@@ -807,10 +1057,11 @@ header .title{color:var(--muted);flex:1;white-space:nowrap;overflow:hidden;text-
 .menu{position:relative}.menu .list{display:none;position:absolute;right:0;top:44px;min-width:250px;white-space:nowrap;background:var(--s2);border:1px solid var(--edge);border-radius:var(--r-card);padding:6px;z-index:20;box-shadow:0 12px 30px rgba(0,0,0,.5)}
 .menu.open .list{display:block}.menu .list button{display:block;width:100%;text-align:left;border-radius:var(--r-ctl)}.menu .list button.danger{color:var(--danger)}.menu .list hr{border:0;border-top:1px solid var(--line);margin:6px 0}
 #rail{grid-column:1;grid-row:2;background:var(--s1);border-right:1px solid var(--line);overflow:hidden;display:flex;flex-direction:column}
-#rail .top{padding:12px}#rail .top button{width:100%;overflow:hidden;text-overflow:ellipsis}
+#rail .top{padding:12px 12px 10px}#rail .top button{width:100%;overflow:hidden;text-overflow:ellipsis}.railhdr{font-size:13px;font-weight:600;margin:2px 2px 10px;display:flex;justify-content:space-between;align-items:baseline}
+.hsec{padding:10px 14px 4px;font-size:11px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:var(--faint)}
 #hlist{overflow:auto;flex:1}
 .hitem{padding:10px 14px;cursor:pointer;display:flex;flex-direction:column;gap:2px;border-left:2px solid transparent}.hitem:hover{background:var(--s2)}.hitem.on{background:var(--s2);border-left-color:var(--accent)}
-.hitem .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;justify-content:space-between;gap:8px}.hitem .m{font-size:11.5px;color:var(--faint)}
+.hitem .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;justify-content:space-between;gap:8px}.hitem .m{font-size:11.5px;color:var(--faint)}.livedot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px;box-shadow:0 0 0 3px rgba(34,211,238,.18)}
 .hitem .del{color:var(--faint);padding:0 4px;border:0;line-height:1;opacity:0;height:auto}.hitem:hover .del,.hitem.on .del,.hitem:focus-within .del{opacity:1}.hitem .del:hover{color:var(--danger);background:transparent}
 #center{grid-column:2;grid-row:2;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 #chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:24px 0 0}
@@ -890,17 +1141,17 @@ textarea{line-height:1.55}
 }
 </style></head><body>
 <header>
- <button id="railBtn" class="icon" title="History" aria-label="Show or hide history">&#9776;</button>
+ <button id="railBtn" class="icon" title="Conversations" aria-label="Show or hide conversations">&#9776;</button>
  <span class="brand"><svg class="mark" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><g fill="currentColor"><circle cx="16" cy="16" r="3"/><circle cx="16" cy="4" r="2"/><circle cx="24.5" cy="7.5" r="2"/><circle cx="28" cy="16" r="2"/><circle cx="24.5" cy="24.5" r="2"/><circle cx="16" cy="28" r="2"/><circle cx="7.5" cy="24.5" r="2"/><circle cx="4" cy="16" r="2"/><circle cx="7.5" cy="7.5" r="2"/></g></svg><span>Agora</span></span><span class="title" id="hdrTitle"></span>
  <span class="pill" id="status"><span class="dot"></span><span id="statusText">Not started</span></span>
  <button id="details" title="Topic, rounds, and agents" style="color:var(--muted)">Details</button>
  <button id="start" class="primary">Start</button>
- <button id="pause" class="btn">Pause</button>
+ <button id="pause" class="btn">Pause</button><button id="endBtn" class="btn" title="End now with closing statements">End</button>
  <div class="menu" id="menu"><button class="icon" id="menuBtn" title="Conversation actions" aria-label="Conversation actions" aria-haspopup="menu">&#8943;</button><div class="list">
-  <button id="vote">End with closing statements</button><button id="stop" class="danger">Stop this conversation</button></div></div>
+  <button id="vote">End with closing statements</button><button id="stop" class="danger">Stop this conversation</button><hr><button id="expClosing">Download closing statements (.md)</button><button id="expSpeeches">Download conversation (.md)</button><button id="expAll">Download full record (.md)</button></div></div>
  <button class="icon" id="gearBtn" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
 </header>
-<aside id="rail"><div class="grip" id="railGrip" title="Drag to resize"></div><div class="top"><button id="newSess" class="btn">+ New conversation</button></div><div id="hlist"></div></aside>
+<aside id="rail"><div class="grip" id="railGrip" title="Drag to resize"></div><div class="top"><div class="railhdr">Conversations <span id="railCount" class="note"></span></div><button id="newSess" class="primary" style="width:100%">+ New conversation</button></div><div id="hlist"></div></aside>
 
 <main id="center">
  <section id="setup"><div class="inner">
@@ -908,11 +1159,14 @@ textarea{line-height:1.55}
   <div class="field"><label>Title</label><input id="title" placeholder="Named from the topic if left blank"></div>
   <div class="field"><label>Folder the agents work in</label><div class="row"><input id="repo"><button id="browse" class="btn">Browse</button></div><div id="repoBad" class="bad"></div></div>
   <div class="field"><label>Agents <span class="note" id="seatNote">(they speak in this order)</span></label>
-   <div class="row" style="margin-bottom:10px"><select id="tmpl" style="flex:1"><option value="">Start from a template...</option></select><button id="tmplApply" class="btn">Use template</button></div>
+   <div class="row" style="margin-bottom:10px"><select id="tmpl" style="flex:1"><option value="">Start from a template...</option></select><button id="tmplApply" class="btn">Use</button><button id="tmplDel" class="btn" title="Delete this saved template" style="display:none">Delete</button></div>
+   <div class="note" style="margin:-4px 0 10px"><button id="tmplSave" class="btn sm">Save current setup as a template</button> <span style="margin-left:6px">Saves agents, models, colors, stances, topic, mode, and all settings for reuse.</span></div>
    <div id="seats"></div><button id="add" class="btn">+ Add agent</button></div>
   <div class="field"><label>Topic</label><textarea id="topic"></textarea></div>
   <div class="field"><label>Extra instructions (optional)</label><textarea id="extra" style="min-height:70px" placeholder="Anything else they must do, avoid, or produce"></textarea></div>
+  <div class="field"><label>What this is</label><div class="row"><button class="btn" id="frCouncil" style="flex:1">Council</button><button class="btn" id="frGame" style="flex:1">Game</button></div><div class="note" style="margin-top:6px" id="frNote"></div></div>
   <div class="field"><label>How they speak</label><div class="row" id="modeRow"><button class="btn" data-m="turns" id="modeTurns" style="flex:1">Take turns</button><button class="btn" data-m="open" id="modeOpen" style="flex:1">Open floor</button></div><div class="note" id="modeNote" style="margin-top:6px"></div></div>
+  <div class="two" id="limits"><div class="field"><label>Close the floor after this many messages</label><input id="maxMsgs" type="number" min="0" placeholder="no limit"></div><div class="field"><label>Or after this many minutes</label><input id="maxMins" type="number" min="0" placeholder="no limit"></div></div>
   <div class="two"><div class="field"><label id="roundsLabel">Rounds</label><input id="rounds" type="number" min="1"><div class="note" id="roundsNote" style="margin-top:6px">Each agent speaks once per round, then gives a closing statement.</div></div>
    <div class="field"><label>Access</label><label class="check"><input id="ro" type="checkbox"><span>Read only<br><span class="note">Agents can read and search but not run or change anything.</span></span></label><div class="note" id="roNote" style="margin-top:6px"></div></div></div>
   <div class="field"><label>Installed CLIs</label><div id="vers" class="vers note"></div></div>
@@ -924,7 +1178,7 @@ textarea{line-height:1.55}
 
 <aside id="terms"><div class="grip" id="termGrip" title="Drag to resize"></div><div class="empty">Each agent's live terminal appears here after you press Start.</div></aside>
 
-<nav id="tabs"><button data-t="chat" class="on">Chat</button><button data-t="terms">Terminals</button><button data-t="rail">History</button><button data-t="settings" id="tabSettings">Settings</button></nav>
+<nav id="tabs"><button data-t="chat" class="on">Chat</button><button data-t="terms">Terminals</button><button data-t="rail">Conversations</button><button data-t="settings" id="tabSettings">Settings</button></nav>
 <div id="settings" class="sheetwrap"><div class="panel"><h1>Settings <button class="icon" id="settingsClose" aria-label="Close settings">&#10005;</button></h1>
  <section class="sg"><h2>Phone</h2><div class="note">Open Agora on your phone. The Tailscale link works anywhere; the home link only on your wifi.</div>
   <div class="kv"><span>Anywhere</span><code id="awayUrl">not available</code><button class="btn sm cp" data-for="awayUrl">Copy</button></div>
@@ -936,7 +1190,7 @@ textarea{line-height:1.55}
   <div class="kv"><span>Panel sizes</span><button class="btn sm" id="layoutReset">Reset to defaults</button></div></section>
  <section class="sg"><h2>Agora</h2>
   <div class="kv"><span>Conversations folder</span><code id="sessDir"></code></div>
-  <div class="row" style="margin-top:10px"><button id="quit" class="danger">Quit Agora</button><span class="note">Kills every CLI Agora started and closes the server. Conversations are kept.</span></div></section>
+  <div class="row" style="margin-top:10px"><button id="quit" class="danger solid">Quit Agora</button><span class="note">Kills every CLI Agora started and closes the server. Conversations are kept.</span></div></section>
 </div></div>
 <div id="sheet" class="sheetwrap"><div class="panel"><h1>Details <button class="icon" id="sheetClose" aria-label="Close details">&#10005;</button></h1><div id="sheetBody"></div>
  <div style="position:sticky;bottom:0;background:var(--s1);padding:12px 0 8px;border-top:1px solid var(--line);margin-top:16px"><button id="sheetSave" class="primary">Save changes</button><div class="note" id="saveState" style="margin-top:8px">Changes save automatically when you leave a field.</div></div></div></div>
@@ -987,7 +1241,9 @@ function renderTerms(s){const started=s.transcript.length>0||['running','voting'
   el.querySelector('.nm').innerHTML=`<span class="av ${t.state==='speaking'?'on':''}">${esc((lbl(seat)||'?')[0])}</span> <b>${esc(lbl(seat))}</b><span>${esc((seat.provider||'')+' · '+(seat.model||''))}</span>`;
   el.classList.toggle('speaking',t.state==='speaking');el.querySelector('.st').textContent=t.state==='speaking'?'Speaking':'';
   const pre=el.querySelector('pre');const atBottom=pre.scrollHeight-pre.scrollTop-pre.clientHeight<40;if(pre.dataset.count!=t.count){pre.textContent=t.lines.length?t.lines.join('\n'):'No live output yet. This pane fills when the agent next speaks. Earlier turns are in the conversation and in the agent\'s memory file.';pre.style.color=t.lines.length?'':'var(--faint)';pre.dataset.count=t.count;if(atBottom)pre.scrollTop=pre.scrollHeight}})}
-function renderHist(s){$('hlist').innerHTML=s.sessions.map(h=>`<div class="hitem ${h.id===s.id?'on':''}" data-id="${h.id}" tabindex="0" role="button"><div class="t"><span>${esc(h.title)}</span><button class="del" data-id="${h.id}" aria-label="Delete conversation ${esc(h.title)}" title="Delete">&times;</button></div><div class="m">${esc(h.created.replace('T',' '))} · ${h.turns?h.turns+' turns':'draft'}</div></div>`).join('');
+function renderHist(s){const live=new Set(s.live||[]);$('railCount').textContent=s.sessions.length;const item=h=>`<div class="hitem ${h.id===s.id?'on':''}" data-id="${h.id}" tabindex="0" role="button"><div class="t"><span>${live.has(h.id)?'<span class="livedot"></span>':''}${esc(h.title)}</span><button class="del" data-id="${h.id}" aria-label="Delete conversation ${esc(h.title)}" title="Delete">&times;</button></div><div class="m">${esc(h.created.replace('T',' '))} · ${h.turns?h.turns+' turns':'draft'}</div></div>`;
+ const L=s.sessions.filter(h=>live.has(h.id)),E=s.sessions.filter(h=>!live.has(h.id));
+ $('hlist').innerHTML=(L.length?'<div class="hsec">Live now</div>'+L.map(item).join(''):'')+(E.length?'<div class="hsec">'+(L.length?'Earlier':'All')+'</div>'+E.map(item).join(''):'');
  document.querySelectorAll('.hitem').forEach(d=>{d.onkeydown=e=>{if(e.key==='Enter')d.click()};d.onclick=async e=>{if(e.target.classList.contains('del')){if(confirm('Delete this conversation and its transcript?'))render(await api('/session/delete',{id:e.target.dataset.id}));return}
   S=null;termKey='';render(await api('/session/open',{id:d.dataset.id}));if(mobile())showTab('chat')}})}
 function renderVers(s){$('vers').innerHTML=Object.entries(s.providers).map(([k,p])=>{if(p.isolated)return `<div>${esc(k)}: runs the newest Codex release, downloaded on first use, without touching your installed Codex.</div>`;
@@ -1001,19 +1257,21 @@ function render(s){const first=!S||S.id!==s.id;S=s;providers=s.providers;
  const startLbl=paused?'Resume':(s.status==='done'||s.status==='stopped')?'Continue':'Start';
  $('start').textContent=startLbl;$('start').title=startLbl==='Continue'?`Continue for ${s.rounds} more rounds`:'';
  $('start').style.display=busy?'none':'';$('start').disabled=!s.repo_ok||s.seats.length<2;$('start2').disabled=$('start').disabled;$('start2').style.display=started?'none':'';
- $('pause').style.display=busy?'':'none';$('pause').disabled=s.status!=='running';$('vote').disabled=!busy;$('stop').disabled=!busy&&!paused;$('newSess').disabled=busy;
+ $('pause').style.display=busy?'':'none';$('pause').disabled=s.status!=='running';$('vote').disabled=!busy;$('stop').disabled=!busy&&!paused;
  $('details').style.display=(started||busy)?'':'none';
  const can=busy||paused;$('sayBtn').disabled=!can;$('sayText').placeholder='Message the agents';
  $('roNote').textContent=s.readonly?'':'Full access: no permission prompts, agents can edit files. Use a folder with a clean git status.';
  $('repoBad').textContent=s.repo_ok?'':'That folder does not exist.';
+ const game=s.framing==='game';$('frCouncil').classList.toggle('on',!game);$('frGame').classList.toggle('on',game);$('frCouncil').disabled=busy;$('frGame').disabled=busy;$('frNote').textContent=game?'Characters with fixed stats. Words persuade, only the World changes numbers, every message ends with one ACTION line. Seat one agent named World with the referee stance.':'Agents debate the topic, cite the folder, and give closing statements.';
  const open=s.mode==='open';$('modeTurns').classList.toggle('on',!open);$('modeOpen').classList.toggle('on',open);$('modeTurns').disabled=busy;$('modeOpen').disabled=busy;
- $('modeNote').textContent=open?'No turns, no limits. Every message goes to everyone at once and each agent replies or passes. Use @Name to demand an answer. When everyone passes on the latest message, the floor closes and closing statements begin.':'Agents speak one after another in seat order.';
- $('rounds').closest('.field').style.display=open?'none':'';
+ $('modeNote').textContent=(s.framing==='game'?'Game framing: characters with fixed stats, the World referees. ':'')+(open?'No turns. Every message goes to everyone at once and each agent replies or passes. Use @Name to demand an answer. The floor closes when everyone passes, when a limit below is hit, or when you press End.':'Agents speak one after another in seat order.');
+ $('rounds').closest('.field').style.display=open?'none':'';$('limits').style.display=open?'':'none';$('maxMsgs').disabled=false;$('maxMins').disabled=false;$('endBtn').style.display=(busy&&open)?'':'none';
  $('roundsNote').textContent=started?`${s.rounds_done} round(s) done. Continue adds this many more.`:'Each agent speaks once per round, then gives a closing statement.';
  $('repo').disabled=started;$('browse').disabled=started;$('ro').disabled=busy||paused;
  const opts='<option value="">Everyone</option>'+s.seats.map(x=>`<option value="${esc(lbl(x))}">${esc(lbl(x))}</option>`).join('');if($('sayTo').innerHTML!==opts)$('sayTo').innerHTML=opts;
- const topts='<option value="">Start from a template...</option>'+(s.templates||[]).map(t=>`<option>${esc(t)}</option>`).join('');if($('tmpl').innerHTML!==topts)$('tmpl').innerHTML=topts;$('tmpl').disabled=started||busy;$('tmplApply').disabled=started||busy;
- if(first||!editing){$('title').value=s.title;$('repo').value=s.repo;$('topic').value=s.topic;$('extra').value=s.extra;$('rounds').value=s.rounds;$('ro').checked=s.readonly;
+ const ut=s.user_templates||[];const topts='<option value="">Start from a template...</option>'+(ut.length?'<optgroup label="My templates">'+ut.map(t=>`<option>${esc(t)}</option>`).join('')+'</optgroup>':'')+'<optgroup label="Built in">'+(s.templates||[]).map(t=>`<option>${esc(t)}</option>`).join('')+'</optgroup>';
+ if($('tmpl').innerHTML!==topts){const cur=$('tmpl').value;$('tmpl').innerHTML=topts;$('tmpl').value=cur}$('tmpl').disabled=started||busy;$('tmplApply').disabled=started||busy;$('tmplDel').style.display=ut.includes($('tmpl').value)?'':'none';
+ if(first||!editing){$('title').value=s.title;$('repo').value=s.repo;$('topic').value=s.topic;$('extra').value=s.extra;$('rounds').value=s.rounds;$('maxMsgs').value=s.max_messages||'';$('maxMins').value=s.max_minutes||'';$('ro').checked=s.readonly;
   if(first||seatsLocked!==started||JSON.stringify(seatsFromDom())!==JSON.stringify(s.seats.map(x=>({name:x.name,provider:x.provider,model:x.model,stance:x.stance,color:x.color})))){renderSeats(s.seats,started);seatsLocked=started}renderVers(s)}
  renderHist(s);
  // empty-state setup vs conversation
@@ -1034,15 +1292,19 @@ $('menuBtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open')}
 $('details').onclick=()=>{$('sheetBody').appendChild($('setup').querySelector('.inner'));$('setup').querySelector('.inner')||0;$('sheet').classList.add('open');$('sheetBody').querySelector('h1').style.display='none';$('sheetBody').querySelector('.lead').style.display='none'};
 $('sheetClose').onclick=()=>{const inner=$('sheetBody').querySelector('.inner');if(inner){inner.querySelector('h1').style.display='';inner.querySelector('.lead').style.display='';$('setup').appendChild(inner)}$('sheet').classList.remove('open')};
 let saveSeq=0;
-async function save(){const my=++saveSeq;const r=await api('/config',{seats:seatsFromDom(),title:$('title').value,topic:$('topic').value,extra:$('extra').value,rounds:+$('rounds').value,repo:$('repo').value,readonly:$('ro').checked});
+async function save(){const my=++saveSeq;const r=await api('/config',{seats:seatsFromDom(),title:$('title').value,topic:$('topic').value,extra:$('extra').value,rounds:+$('rounds').value,repo:$('repo').value,readonly:$('ro').checked,max_messages:+($('maxMsgs').value||0),max_minutes:+($('maxMins').value||0)});
  if(my===saveSeq){const t=new Date();$('saveState').textContent='Saved '+t.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})+'. Model and stance changes apply on that agent\'s next turn.'}return render(r)}
 $('sheetSave').onclick=async()=>{editing=false;await save()};
 $('tmplApply').onclick=async()=>{const n=$('tmpl').value;if(!n)return;S=null;render(await api('/template',{name:n}))};
+$('tmpl').onchange=()=>{$('tmplDel').style.display=(S&&(S.user_templates||[]).includes($('tmpl').value))?'':'none'};
+$('tmplSave').onclick=async()=>{await save();const n=prompt('Name this template:',S&&S.title?S.title:'');if(!n)return;render(await api('/template/save',{name:n}));$('tmpl').value=n;$('tmplDel').style.display=''};
+$('tmplDel').onclick=async()=>{const n=$('tmpl').value;if(!n||!confirm('Delete template "'+n+'"?'))return;render(await api('/template/delete',{name:n}));$('tmpl').value=''};
 $('add').onclick=async()=>{editing=true;const s=seatsFromDom();const k=Object.keys(providers)[0];s.push({name:'',provider:k,model:providers[k].models[0],stance:''});renderSeats(s,false);await save();editing=false};
 $('newSess').onclick=async()=>{S=null;termKey='';render(await api('/session/new',{}));if(mobile())showTab('setup')};
 $('start').onclick=async()=>{await save();render(await api('/start',{}));$('sheetClose').click();closeMenu();if(mobile())showTab('chat')};$('start2').onclick=()=>$('start').click();
 $('pause').onclick=async()=>render(await api('/pause',{}));
 $('vote').onclick=async()=>{closeMenu();render(await api('/vote',{}))};
+[['expClosing','closing'],['expSpeeches','speeches'],['expAll','all']].forEach(([id,w])=>$(id).onclick=()=>{closeMenu();if(S)window.location='/export?what='+w+'&id='+encodeURIComponent(S.id)});$('endBtn').onclick=async()=>{if(confirm('End the open floor now? Agents still composing will finish, then everyone gives a closing statement.'))render(await api('/vote',{}))};
 $('stop').onclick=async()=>{closeMenu();if(confirm('Stop this conversation? The transcript is kept and you can continue it later.'))render(await api('/stop',{}))};
 $('quit').onclick=async()=>{if(!confirm('Quit Agora? This kills every CLI it started and closes the server. Conversations are kept.'))return;try{await api('/shutdown',{})}catch(e){}document.body.innerHTML='<div style="padding:40px;color:#8B8B94">Agora is closed. You can close this tab.</div>'};
 $('sayBtn').onclick=async()=>{const t=$('sayText').value.trim();if(!t)return;$('sayText').value='';hlSync();render(await api('/say',{text:t,target:$('sayTo').value}))};
@@ -1064,8 +1326,8 @@ $('sayText').onkeydown=e=>{const open=$('ac').classList.contains('open');
  if(open&&e.key==='Escape'){acClose();return}
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('sayBtn').click()}};
 $('tg').onclick=async()=>{$('tgState').textContent='Sending...';const r=await api('/telegram',{});$('tgState').textContent=r.last_tg||'No response'};
-let saveTimer=null;['title','repo','topic','extra','rounds'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
-$('ro').onchange=save;$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
+let saveTimer=null;['title','repo','topic','extra','rounds','maxMsgs','maxMins'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
+$('ro').onchange=save;$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
 let pk={path:''};
 async function openPk(p){const d=await api('/ls?path='+encodeURIComponent(p||$('repo').value));pk=d;$('pkPath').value=d.path;
  const sep=d.path.includes('\\')?'\\':'/';const base=d.path.replace(/[\\/]$/,'');
@@ -1093,6 +1355,7 @@ def make_handler(agora: Agora, token: str):
         def log_message(self, *a): pass
         def _send(self, body: bytes, ctype: str):
             self.send_response(200); self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Pragma", "no-cache")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         def _authed(self) -> bool:
             from urllib.parse import parse_qs, urlparse
@@ -1107,6 +1370,16 @@ def make_handler(agora: Agora, token: str):
         def do_GET(self):
             if not self._authed(): return
             if self.path == "/state": return self._send(json.dumps(agora.snapshot()).encode(), "application/json")
+            if self.path.startswith("/export"):
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query); what = q.get("what", ["all"])[0]; sid = q.get("id", [agora.s.id])[0]
+                sess = agora.s if sid == agora.s.id else Session.load(sid)
+                if not sess: return self._send(b"no such conversation", "text/plain")
+                body = sess.export_md(what).encode("utf-8")
+                safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (sess.title or "conversation"))[:60].strip() or "conversation"
+                self.send_response(200); self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="agora-{safe}-{what}.md"')
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
             if self.path.startswith("/ls"):
                 from urllib.parse import parse_qs, urlparse
                 q = parse_qs(urlparse(self.path).query).get("path", [""])[0]
@@ -1121,6 +1394,8 @@ def make_handler(agora: Agora, token: str):
              "/session/new": agora.new_session, "/session/open": lambda: agora.open_session(data.get("id", "")),
              "/session/delete": lambda: agora.delete_session(data.get("id", "")),
              "/template": lambda: agora.apply_template(data.get("name", "")),
+             "/template/save": lambda: agora.save_template(data.get("name", "")),
+             "/template/delete": lambda: delete_user_template(data.get("name", "")),
              "/telegram": agora.send_link}.get(self.path, lambda: None)()
             self._send(json.dumps(agora.snapshot()).encode(), "application/json")
     return H
