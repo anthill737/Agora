@@ -40,17 +40,30 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DEFAULT_REPO = str(Path.home())   # pick the folder you want the agents to read in Setup
-BUILD = "2026-09-06.7"
+DEFAULT_REPO = str(Path.home())   # the folder offered when a conversation chooses "A folder I choose"
+BUILD = "2026-09-06.8"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
+ROOM = HERE.with_name("agora_room")   # the empty room agents sit in when a conversation points at no folder
+
+
+def room_dir() -> str:
+    """One shared, empty, disposable folder next to Agora. Created on demand, recreated if deleted, trusted for Codex once."""
+    ROOM.mkdir(exist_ok=True)
+    marker = ROOM / "README.txt"
+    if not marker.exists():
+        marker.write_text("This folder is Agora's empty room: the working directory for conversations that are not about any code. "
+                          "There is nothing here to read. Agora recreates it when it is missing; deleting it is safe.\n", encoding="utf-8")
+    return str(ROOM)
+
+
 ASK = "Read the file {prompt_file} and respond exactly as it instructs. Your final message is your speech."
 SESSIONS = HERE.with_name("agora_sessions")
 TAIL = 400
 
 # Provider definitions. Never shown in the UI.
-#   cmd: {ask} and {model} are filled in.
+#   cmd: {ask}, {model} and {seat_dir} (the agent's own folder with its prompt and memory files) are filled in.
 #   speech: how the finished speech is extracted from the run.
 #     "claude_stream" parses Claude's stream-json events; "stdout" uses stdout only.
 PROVIDERS = {
@@ -86,9 +99,10 @@ PROVIDERS = {
         # read-only tools are allowed without asking; write and shell need --allow-all-tools. -s prints only the answer.
         "exe": "copilot", "speech": "stdout", "pkg": "@github/copilot",
         # "auto" lets Copilot pick; which named models an account may use varies, so type one in the seat's Custom box if you need it.
-        "cmd": 'copilot -p "{ask}" --model {model} -s --no-ask-user --no-auto-update --allow-all-tools',
+        # Copilot may only touch files inside its working folder, so the seat's own folder (prompt + memory) is added explicitly.
+        "cmd": 'copilot -p "{ask}" --model {model} -s --no-ask-user --no-auto-update --add-dir "{seat_dir}" --allow-all-tools',
         "resume": "",
-        "ro_cmd": 'copilot -p "{ask}" --model {model} -s --no-ask-user --no-auto-update',
+        "ro_cmd": 'copilot -p "{ask}" --model {model} -s --no-ask-user --no-auto-update --add-dir "{seat_dir}"',
         "models": ["auto"],
     },
     "Gemini CLI": {
@@ -189,6 +203,15 @@ _GATES: dict[str, threading.Lock] = {k: threading.Lock() for k in PROVIDERS}   #
 _AUTH_RE = re.compile(r"oauth|not logged in|/login\b|log in|authenticat|unauthori[sz]ed|\b401\b|invalid api key|token.{0,30}(expired|refresh|revoked)|please run .?claude.?\s*(auth|login)", re.I)
 
 
+def decode_out(b: bytes) -> str:
+    """CLI output as text. UTF-8 first; a CLI that writes the Windows console code page instead gets a second try."""
+    try: return b.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        try: return b.decode(locale.getpreferredencoding(False))
+        except Exception: return b.decode("utf-8", errors="replace")
+
+
 def looks_like_auth_error(text: str) -> bool:
     return bool(_AUTH_RE.search(text or ""))
 
@@ -207,10 +230,10 @@ def auth_hint(provider: str, text: str) -> str:
     return ""
 
 
-def build_cmd(provider: str, ask: str, model: str, readonly: bool) -> str:
+def build_cmd(provider: str, ask: str, model: str, readonly: bool, seat_dir: str = "") -> str:
     """The shell command for one turn, using the saved executable path when there is one."""
     prov = PROVIDERS[provider]
-    cmd = prov["ro_cmd" if readonly else "cmd"].format(ask=ask, model=model)
+    cmd = prov["ro_cmd" if readonly else "cmd"].format(ask=ask, model=model, seat_dir=seat_dir or str(Path.home()))
     exe = exe_of(provider)
     if exe != prov["exe"] and cmd.startswith(prov["exe"] + " "): cmd = f'"{exe}"' + cmd[len(prov["exe"]):]
     return cmd
@@ -226,14 +249,13 @@ def cli_test(provider: str, folder: str) -> None:
     if not cli_path(provider):
         TESTS[provider] = {"ok": False, "text": "not found", "secs": 0, "when": dt.datetime.now().strftime("%H:%M")}; return
     model = ARENA_MODEL.get(provider) or prov["models"][0]
-    cmd = build_cmd(provider, "Reply with the single word OK and nothing else.", model, readonly=True)
     cwd = folder if Path(folder).is_dir() else str(Path.home())
+    cmd = build_cmd(provider, "Reply with the single word OK and nothing else.", model, readonly=True, seat_dir=cwd)
     t0 = time.time(); gate = _GATES[provider] if prov.get("gate") else None
     got = bool(gate and gate.acquire(timeout=120))
     try:
-        r = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=180, stdin=subprocess.DEVNULL, env=child_env(provider))
-        out, err = r.stdout or "", r.stderr or ""; final = ""
+        r = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, timeout=180, stdin=subprocess.DEVNULL, env=child_env(provider))
+        out, err = decode_out(r.stdout or b""), decode_out(r.stderr or b""); final = ""
         if prov["speech"] == "claude_stream":
             for ln in out.splitlines():
                 try: ev = json.loads(ln)
@@ -254,11 +276,12 @@ def cli_test(provider: str, folder: str) -> None:
     TESTS[provider] = {"ok": ok, "text": text, "hint": hint, "secs": round(time.time() - t0, 1), "when": dt.datetime.now().strftime("%H:%M")}
 
 
-DEFAULT_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Read this folder to check any claim you make, cite file and line, and disagree openly.")
+DEFAULT_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Say only what you can observe about yourself right now or cite from public documentation, label each claim, and disagree openly.")
+FOLDER_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Read this folder to check any claim you make, cite file and line, and disagree openly.")
+DEFAULT_TOPICS = (DEFAULT_TOPIC, FOLDER_TOPIC)
 
 FRAMING = """You are a speaker in a recorded council of AI coding agents. Each
-speaker is a different model running in its own CLI. All of you are sitting
-inside the same folder and may read its files to check claims.
+speaker is a different model running in its own CLI. {where}
 
 Knowability rule: label claims about yourself OBSERVED (visible in your
 context, tools, or environment now), DOCUMENTED (public docs or source you
@@ -269,7 +292,7 @@ Read it before you speak if you need the history; the prompt only carries
 what was said since your last turn. The convener (Anthony) may interject at
 any time; when he does, address what he said before anything else.
 
-Rules: read files to verify claims and cite paths. Disagree openly with any
+Rules: {verify}Disagree openly with any
 speaker you think is wrong or bluffing. Stay concrete. Do not modify, create,
 or delete any files; you are here to speak, not to work. No em dashes.
 
@@ -280,6 +303,16 @@ with one citation, and stop. Every sentence must earn its place; if it can be
 cut without losing the point, cut it.
 
 Your final message is your speech; put nothing after it."""
+
+WHERE_FOLDER = "All of you are sitting inside the same folder and may read its files to check claims."
+WHERE_ROOM = ("All of you are sitting in an empty room. There are no files worth reading here and nothing to look up, "
+              "so speak from what you know and label it honestly.")
+VERIFY_FOLDER = "read files to verify claims and cite paths. "
+
+
+def framing_for(room: bool) -> str:
+    return FRAMING.format(where=WHERE_ROOM if room else WHERE_FOLDER, verify="" if room else VERIFY_FOLDER)
+
 
 OPENING = """You speak first. Answer the topic directly with the single most
 important thing you have to say, labeled with the knowability rule where it
@@ -471,9 +504,9 @@ def game_shape(s: "Session") -> None:
         n, st = pool.pop(0); x["stance"] = st
         if not x.get("name"): x["name"] = n
     s.seats = color_seats(seats); s.skipped = [False] * len(seats)
-    if s.topic.strip() in ("", DEFAULT_TOPIC): s.topic = ARENA_TOPIC
+    if s.topic.strip() in ("",) + DEFAULT_TOPICS: s.topic = ARENA_TOPIC
     if s.rounds == 3: s.rounds = 6
-    s.mode = "turns"
+    s.mode = "turns"; s.room = True; s.readonly = True   # a game reads no files, so it sits in the room
 
 
 def council_shape(s: "Session") -> None:
@@ -761,9 +794,10 @@ class Session:
         self.title = d.get("title", "")
         self.created = d.get("created", dt.datetime.now().isoformat(timespec="minutes"))
         self.repo = d.get("repo", DEFAULT_REPO)
+        self.room = bool(d.get("room", not d))   # new conversations sit in the room; older saved ones keep their folder
         self.seats = color_seats(d.get("seats", [dict(x) for x in DEFAULT_SEATS]))
         self.topic = d.get("topic", DEFAULT_TOPIC); self.extra = d.get("extra", "")
-        self.rounds = d.get("rounds", 3); self.readonly = d.get("readonly", True)
+        self.rounds = d.get("rounds", 3); self.readonly = bool(d.get("readonly", True)) or self.room   # the room is always read-only
         self.mode = d.get("mode", "turns")   # turns | open
         self.framing = d.get("framing", "council")   # council | game
         self.referee = d.get("referee", "")          # agent name whose messages wake everyone; others wake only it + mentions
@@ -778,8 +812,17 @@ class Session:
         self.cli_sessions = d.get("cli_sessions", {})       # seat index -> CLI session id (Claude resume)
         self.last_seen = d.get("last_seen", {})             # seat index -> transcript length when it last spoke
 
+    @property
+    def workdir(self) -> str:
+        """Where the CLIs run: the shared empty room, or the folder the user chose."""
+        return room_dir() if self.room else self.repo
+
+    @property
+    def place(self) -> str:
+        return "nowhere in particular (Agora's empty room)" if self.room else self.repo
+
     def to_dict(self) -> dict:
-        return {"title": self.title, "created": self.created, "repo": self.repo, "seats": self.seats,
+        return {"title": self.title, "created": self.created, "repo": self.repo, "room": self.room, "seats": self.seats,
                 "topic": self.topic, "extra": self.extra, "rounds": self.rounds, "readonly": self.readonly, "mode": self.mode,
                 "max_messages": self.max_messages, "max_minutes": self.max_minutes, "started_at": self.started_at, "framing": self.framing, "referee": self.referee,
                 "transcript": self.transcript, "turn": self.turn, "status": self.status,
@@ -789,7 +832,7 @@ class Session:
     def save(self, transcript_md: bool = False) -> None:
         (self.dir / "session.json").write_text(json.dumps(self.to_dict()), encoding="utf-8")
         if not transcript_md: return
-        md = [f"# {self.title or 'Conversation'}", f"Created: {self.created}", f"Folder: {self.repo}", "",
+        md = [f"# {self.title or 'Conversation'}", f"Created: {self.created}", f"Folder: {self.place}", "",
               "Agents:"] + [f"- {s['name']}: {s['provider']} ({s['model']})" for s in self.seats] + ["", f"Topic: {self.topic}", self.extra, ""]
         for e in self.transcript: md += [f"## Turn {e['turn']}: {e['speaker']} ({e['kind']})", "", e["text"], ""]
         (self.dir / "transcript.md").write_text("\n".join(md), encoding="utf-8")
@@ -804,7 +847,7 @@ class Session:
     def export_md(self, what: str = "all") -> str:
         """Markdown export. what: all | closing | speeches (no live-terminal noise, no system notes)."""
         keep = {"all": None, "closing": {"resolution"}, "speeches": {"speech", "resolution", "convener"}}.get(what)
-        md = [f"# {self.title or 'Conversation'}", f"Created: {self.created}  ", f"Mode: {'open floor' if self.mode == 'open' else 'take turns'}  ", f"Folder: {self.repo}", "",
+        md = [f"# {self.title or 'Conversation'}", f"Created: {self.created}  ", f"Mode: {'open floor' if self.mode == 'open' else 'take turns'}  ", f"Folder: {self.place}", "",
               "## Agents", ""] + [f"- **{s['name']}** ({s['provider']}, {s['model']})" + (f": {s['stance']}" if s.get('stance') else "") for s in self.seats]
         md += ["", "## Topic", "", self.topic, ""]
         if self.extra.strip(): md += ["## Extra instructions", "", self.extra, ""]
@@ -885,7 +928,7 @@ class Run:
     def start(self) -> None:
         with self.lock:
             s = self.s
-            if self.busy() or len(s.seats) < 2 or not Path(s.repo).is_dir(): return
+            if self.busy() or len(s.seats) < 2 or not Path(s.workdir).is_dir(): return
             if s.status == "paused" and self.thread and self.thread.is_alive():
                 self.pause_flag.clear(); s.status = "running"; s.save(); return
             if s.status == "done": s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(s.seats))
@@ -895,7 +938,7 @@ class Run:
             s.status = "running"; s.started_at = time.time(); s.save()
             for i in range(len(s.seats)): s.seat_dir(i)   # memory files exist before anyone speaks
             if any(PROVIDERS[x["provider"]]["exe"] in ("codex", "npx") for x in s.seats):
-                note = ensure_codex_trust(s.repo)
+                note = ensure_codex_trust(s.workdir)
                 if note: self._record("Agora", note, "system")
             if not self.terms: self._reset_terms()
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
@@ -969,7 +1012,7 @@ class Run:
         s = self.s; me = s.label(seat)
         others = ", ".join(f"{s.label(x)} ({x['provider']}, {x['model']})" for x in s.seats if x is not seat)
         game = s.framing == "game"
-        parts = [GAME_FRAMING if game else FRAMING, f"\n{'The arena and its rules' if game else 'Topic'}:\n{s.topic}\n"]
+        parts = [GAME_FRAMING if game else framing_for(s.room), f"\n{'The arena and its rules' if game else 'Topic'}:\n{s.topic}\n"]
         if s.extra.strip(): parts.append(f"Additional instructions from the convener:\n{s.extra}\n")
         if game:
             parts.append(f"You are {me}. The other characters: {', '.join(s.label(x) for x in s.seats if x is not seat)}.\n")
@@ -989,7 +1032,7 @@ class Run:
 
     def _command(self, i: int, seat: dict, prompt_file: Path) -> str:
         s = self.s; prov = PROVIDERS[seat["provider"]]
-        cmd = build_cmd(seat["provider"], ASK.format(prompt_file=prompt_file), seat["model"], s.readonly)
+        cmd = build_cmd(seat["provider"], ASK.format(prompt_file=prompt_file), seat["model"], s.readonly or s.room, str(s.seat_dir(i)))
         sid = s.cli_sessions.get(str(i))
         if sid and prov.get("resume"): cmd += prov["resume"].format(sid=sid)
         return cmd
@@ -1041,14 +1084,15 @@ class Run:
             nonlocal held
             if held: held = False; gate.release()   # type: ignore[union-attr]
         try:
-            proc = subprocess.Popen(cmd, cwd=s.repo, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace", start_new_session=(os.name != "nt"), env=child_env(seat["provider"]))
+            proc = subprocess.Popen(cmd, cwd=s.workdir, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=(os.name != "nt"), env=child_env(seat["provider"]))
             self.procs[i] = proc
             def pump_err(p: subprocess.Popen) -> None:
-                for ln in p.stderr:  # type: ignore[union-attr]
-                    err_tail.append(ln.rstrip("\n")); del err_tail[:-8]; self._term(i, ln.rstrip("\n"))
+                for raw in p.stderr:  # type: ignore[union-attr]
+                    ln = decode_out(raw).rstrip("\r\n"); err_tail.append(ln); del err_tail[:-8]; self._term(i, ln)
             threading.Thread(target=pump_err, args=(proc,), daemon=True).start()
-            for ln in proc.stdout:  # type: ignore[union-attr]
+            for raw in proc.stdout:  # type: ignore[union-attr]
+                ln = decode_out(raw).rstrip("\r\n") + "\n"
                 if held and ln.strip(): let_go()
                 stdout_lines.append(ln)
                 if prov["speech"] == "claude_stream":
@@ -1294,7 +1338,7 @@ class Agora:
             return {"id": s.id, "title": s.title, "seats": list(s.seats), "topic": s.topic, "extra": s.extra, "transcript_total": len(s.transcript), "last_turn": s.turn,
                     "rounds": s.rounds, "readonly": s.readonly, "mode": s.mode,
                     "max_messages": s.max_messages, "max_minutes": s.max_minutes, "started_at": s.started_at, "framing": s.framing, "referee": s.referee, "transcript": tr, "status": s.status,
-                    "current": r.current, "turn": s.turn, "repo": s.repo, "repo_ok": Path(s.repo).is_dir(),
+                    "current": r.current, "turn": s.turn, "repo": s.repo, "room": s.room, "workdir": s.workdir, "repo_ok": Path(s.workdir).is_dir(),
                     "rounds_done": s.rounds_done, "sessions": list_sessions(), "live": live,
                     "terms": tstates,
                     "phone_url": self.phone_url, "away_url": self.away_url, "last_tg": self.last_tg,
@@ -1333,7 +1377,7 @@ class Agora:
         if not name: return
         s = self.s
         save_user_template(name, {"seats": [dict(x) for x in s.seats], "framing": s.framing, "referee": s.referee, "mode": s.mode, "rounds": s.rounds,
-                                  "readonly": s.readonly, "topic": s.topic, "extra": s.extra, "repo": s.repo,
+                                  "readonly": s.readonly, "topic": s.topic, "extra": s.extra, "repo": s.repo, "room": s.room,
                                   "max_messages": s.max_messages, "max_minutes": s.max_minutes})
 
     def apply_template(self, name: str) -> None:
@@ -1344,8 +1388,9 @@ class Agora:
             if name in ut:   # a saved layout: restore everything
                 d = ut[name]; s = r.s
                 s.seats = color_seats([dict(x) for x in d.get("seats", [])]); s.skipped = [False] * len(s.seats)
-                for k in ("framing", "referee", "mode", "rounds", "readonly", "topic", "extra", "repo", "max_messages", "max_minutes"):
+                for k in ("framing", "referee", "mode", "rounds", "readonly", "topic", "extra", "repo", "room", "max_messages", "max_minutes"):
                     if k in d: setattr(s, k, d[k])
+                if s.room: s.readonly = True
                 if s.framing == "game" and not s.referee: game_shape(s)
                 r._reset_terms(); s.save(); return
             if name not in TEMPLATES: return
@@ -1384,7 +1429,11 @@ class Agora:
             for k in ("topic", "extra", "title"):
                 if k in d: setattr(s, k, d[k])
             if "rounds" in d: s.rounds = max(1, int(d["rounds"]))
-            if "readonly" in d: s.readonly = bool(d["readonly"])
+            if "room" in d and not s.transcript and not r.busy() and bool(d["room"]) != s.room:
+                s.room = bool(d["room"])
+                if s.topic.strip() in DEFAULT_TOPICS: s.topic = DEFAULT_TOPIC if s.room else FOLDER_TOPIC
+            if "readonly" in d and not s.room: s.readonly = bool(d["readonly"])
+            if s.room: s.readonly = True
             if d.get("mode") in ("turns", "open"): s.mode = d["mode"]
             if d.get("framing") in ("council", "game") and d["framing"] != s.framing:
                 s.framing = d["framing"]
@@ -1577,7 +1626,8 @@ textarea{line-height:1.55}
   <h1>New conversation</h1><p class="lead">Seat the council, set the topic, press Start. You can message them any time.</p>
   <div class="field"><label>Your CLIs <span class="note">(each agent is one of these, run the way you run it in a terminal)</span></label><div id="cliSum" class="clisum"></div><div id="cliNone" class="bad" style="display:none">Agora found no CLI. Install one, log in to it once in a terminal, then check again.</div><div class="row" style="margin-top:8px"><button id="cliOpen" class="btn sm">Connect or check CLIs</button></div></div>
   <div class="field"><label>Title</label><input id="title" placeholder="Named from the topic if left blank"></div>
-  <div class="field"><label>Folder the agents work in</label><div class="row"><input id="repo"><button id="browse" class="btn">Browse</button></div><div id="repoBad" class="bad"></div></div>
+  <div class="field"><label>Where the agents sit</label><div class="row"><button class="btn" id="whRoom" style="flex:1">Nowhere in particular</button><button class="btn" id="whFolder" style="flex:1">A folder I choose</button></div><div class="note" id="whNote" style="margin-top:6px"></div>
+   <div class="row" id="repoRow" style="margin-top:8px"><input id="repo" placeholder="Folder the agents may read"><button id="browse" class="btn">Browse</button></div><div id="repoBad" class="bad"></div></div>
   <div class="field"><label>Agents <span class="note" id="seatNote">(they speak in this order)</span></label>
    <div class="row" style="margin-bottom:10px"><select id="tmpl" style="flex:1"><option value="">Start from a template...</option></select><button id="tmplApply" class="btn">Use</button><button id="tmplDel" class="btn" title="Delete this saved template" style="display:none">Delete</button></div>
    <div class="note" style="margin:-4px 0 10px"><button id="tmplSave" class="btn sm">Save current setup as a template</button> <span style="margin-left:6px">Saves agents, models, colors, stances, topic, mode, and all settings for reuse.</span></div>
@@ -1589,7 +1639,7 @@ textarea{line-height:1.55}
   <div class="field"><label>How they speak</label><div class="row" id="modeRow"><button class="btn" data-m="turns" id="modeTurns" style="flex:1">Take turns</button><button class="btn" data-m="open" id="modeOpen" style="flex:1">Open floor</button></div><div class="note" id="modeNote" style="margin-top:6px"></div></div>
   <div class="two" id="limits"><div class="field"><label>Close the floor after this many messages</label><input id="maxMsgs" type="number" min="0" placeholder="no limit"></div><div class="field"><label>Or after this many minutes</label><input id="maxMins" type="number" min="0" placeholder="no limit"></div></div>
   <div class="two"><div class="field"><label id="roundsLabel">Rounds</label><input id="rounds" type="number" min="1"><div class="note" id="roundsNote" style="margin-top:6px">Each agent speaks once per round, then gives a closing statement.</div></div>
-   <div class="field"><label>Access</label><label class="check"><input id="ro" type="checkbox"><span>Read only<br><span class="note">Agents can read and search but not run or change anything.</span></span></label><div class="note" id="roNote" style="margin-top:6px"></div></div></div>
+   <div class="field" id="roField"><label>Access</label><label class="check"><input id="ro" type="checkbox"><span>Read only<br><span class="note">Agents can read and search but not run or change anything.</span></span></label><div class="note" id="roNote" style="margin-top:6px"></div></div></div>
   <div class="field"><button id="start2" class="primary" style="padding:10px 22px">Start conversation</button></div>
  </div></section>
  <section id="chat"><div class="inner" id="chatInner"><div class="empty" id="chatEmpty" style="text-align:center;padding-top:8vh"><svg class="ringart" viewBox="0 0 32 32" aria-hidden="true"><g fill="currentColor"><circle cx="16" cy="16" r="2.4"/><g opacity=".55"><circle cx="16" cy="4" r="1.6"/><circle cx="24.5" cy="7.5" r="1.6"/><circle cx="28" cy="16" r="1.6"/><circle cx="24.5" cy="24.5" r="1.6"/><circle cx="16" cy="28" r="1.6"/><circle cx="7.5" cy="24.5" r="1.6"/><circle cx="4" cy="16" r="1.6"/><circle cx="7.5" cy="7.5" r="1.6"/></g></g></svg><div>The floor is empty. Each agent's turn appears here as it finishes.</div></div><div id="msgs"></div><div class="typing" id="typing" style="display:none"></div></div></section>
@@ -1716,6 +1766,9 @@ function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeT
  const can=busy||paused;$('sayBtn').disabled=!can;$('sayText').placeholder='Message the agents';
  $('roNote').textContent=s.readonly?'':'Full access: no permission prompts, agents can edit files. Use a folder with a clean git status.';
  $('repoBad').textContent=s.repo_ok?'':'That folder does not exist.';
+ const room=!!s.room;$('whRoom').classList.toggle('on',room);$('whFolder').classList.toggle('on',!room);$('whRoom').disabled=started||busy;$('whFolder').disabled=started||busy;
+ $('repoRow').style.display=room?'none':'';$('repoBad').style.display=room?'none':'';$('roField').style.display=room?'none':'';
+ $('whNote').textContent=room?'An empty folder Agora keeps for itself. Nothing to read, nothing to change, always read-only. Right for most councils and for every game.':'The agents may read and search this folder to check claims and cite files. Pick a folder with a clean git status.';
  const game=s.framing==='game';$('frCouncil').classList.toggle('on',!game);$('frGame').classList.toggle('on',game);$('frCouncil').disabled=busy;$('frGame').disabled=busy;$('frNote').textContent=game?(s.referee?'Characters with fixed stats. Words persuade, only the World changes numbers, every message ends with one ACTION line. Switching to Game seated the World as referee, gave every character without a stance a stat block, set the arena topic, turns, and six rounds. Edit any of it above.':'No referee: the game has nobody to resolve actions. Pick one below, or add an agent named World.'):'Agents debate the topic, cite the folder, and give closing statements. Switching back from Game removes the World and the characters Agora seated.';
  $('frNote').classList.toggle('bad',game&&!s.referee);
  const open=s.mode==='open';$('modeTurns').classList.toggle('on',!open);$('modeOpen').classList.toggle('on',open);$('modeTurns').disabled=busy;$('modeOpen').disabled=busy;
@@ -1812,7 +1865,7 @@ $('tgTest').onclick=async()=>{$('tgS3').textContent='Sending...';const r=await a
 $('tgSave').onclick=async()=>{const r=await api('/telegram/save',{token:$('tgTok').value,chat_id:$('tgChat').value,notify:$('tgNotify').checked,bot:tgBot});
  if(!r.ok){$('tgS3').textContent=r.error;return}$('tgwiz').classList.remove('open');$('tgState').textContent='Connected. Press Send link to my Telegram to get the phone link.';render(await api('/state?since=1000000000&terms=0'))};
 let saveTimer=null;['title','repo','topic','extra','rounds','maxMsgs','maxMins'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
-$('ro').onchange=save;$('referee').onchange=async()=>render(await api('/config',{referee:$('referee').value}));$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
+$('ro').onchange=save;$('whRoom').onclick=async()=>render(await api('/config',{room:true}));$('whFolder').onclick=async()=>render(await api('/config',{room:false}));$('referee').onchange=async()=>render(await api('/config',{referee:$('referee').value}));$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
 let pk={path:''};
 async function openPk(p){const d=await api('/ls?path='+encodeURIComponent(p||$('repo').value));pk=d;$('pkPath').value=d.path;
  const sep=d.path.includes('\\')?'\\':'/';const base=d.path.replace(/[\\/]$/,'');
@@ -1894,7 +1947,7 @@ def make_handler(agora: Agora, token: str):
              "/telegram": agora.send_link,
              "/clis/refresh": lambda: (check_installed(), check_latest()),
              "/clis/path": lambda: (set_cli_path(data.get("provider", ""), data.get("path", "")), check_installed()),
-             "/clis/test": lambda: cli_test(data.get("provider", ""), agora.s.repo)}.get(self.path, lambda: None)()
+             "/clis/test": lambda: cli_test(data.get("provider", ""), agora.s.workdir)}.get(self.path, lambda: None)()
             full = self.path in ("/session/open", "/session/new", "/session/delete", "/template")
             self._send(json.dumps(agora.snapshot(since=-1 if full else 10**9)).encode(), "application/json")
     return H
