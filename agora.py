@@ -38,7 +38,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DEFAULT_REPO = r"C:\Users\antho\Projects\Code\Dev-Team"
+DEFAULT_REPO = str(Path.home())   # pick the folder you want the agents to read in Setup
+BUILD = "2026-09-06.4"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
@@ -88,13 +89,7 @@ PROVIDERS = {
     },
 }
 
-DEFAULT_TOPIC = (
-    "Why does a single agent in a CLI finish long coding tasks reliably while "
-    "DevTeam's multi-seat pipeline falls into review loops, stale context, and "
-    "doom loops? Compare your harness mechanics (context management, tool loop, "
-    "planning, verification, recovery, failure modes, system prompt rules) to "
-    "how DevTeam does the same thing, and propose concrete changes."
-)
+DEFAULT_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Read this folder to check any claim you make, cite file and line, and disagree openly.")
 
 FRAMING = """You are a speaker in a recorded council of AI coding agents. Each
 speaker is a different model running in its own CLI. All of you are sitting
@@ -175,9 +170,11 @@ WORLD_STANCE = ("You are the World, the referee, not a player. You never take ac
 GAME_OPENING = """The arena opens. Introduce yourself in character in two or
 three sentences, then take your first action."""
 
-GAME_REPLY = """Respond in character to what just happened and to anyone who
-addressed you, then take one action. If you truly have nothing to do this
-turn, your action is ACTION: rest."""
+GAME_REPLY = """You witnessed what is listed above. If someone acted on you, spoke
+to you, traded with you, threatened you, or did something in front of you,
+react to it in character: refuse, accept, flee, fight back, gossip about it,
+remember it. Then take one action. If you truly have nothing to do this turn,
+your action is ACTION: rest."""
 
 GAME_VOTE = """The arena closes. In character, give your final words in two or
 three sentences: what you did, who you trust, who wronged you, and what you
@@ -400,11 +397,11 @@ def _tg_call(token: str, method: str, payload: dict | None = None) -> dict:
 
 def tg_send(text: str) -> str:
     """Send a message through the configured bot. Returns a human-readable status. Never logs the token.
-    Deliberately never calls getUpdates: DevTeam's bridge polls this bot, and two pollers conflict."""
+    Deliberately never calls getUpdates: if another program already polls this bot, two pollers conflict."""
     cfg = tg_config()
     token = (cfg.get("token") or "").strip(); chat = str(cfg.get("chat_id") or "").strip()
-    if not token: return "No bot token. Put the DevTeam bot token in agora_telegram.json next to agora.py."
-    if not chat: return "No chat id. Put your Telegram chat id in agora_telegram.json (DevTeam's Telegram settings have it, or message @userinfobot on Telegram and it replies with your id)."
+    if not token: return "No bot token. Put your Telegram bot token in agora_telegram.json next to agora.py."
+    if not chat: return "No chat id. Put your Telegram chat id in agora_telegram.json (message @userinfobot on Telegram and it replies with your id)."
     try:
         res = _tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "disable_web_page_preview": True})
         return "Sent to Telegram." if res.get("ok") else f"Telegram refused: {res.get('description', 'unknown error')}"
@@ -437,6 +434,7 @@ class Session:
         self.rounds = d.get("rounds", 3); self.readonly = d.get("readonly", True)
         self.mode = d.get("mode", "turns")   # turns | open
         self.framing = d.get("framing", "council")   # council | game
+        self.referee = d.get("referee", "")          # agent name whose messages wake everyone; others wake only it + mentions
         self.max_messages = int(d.get("max_messages") or 0)   # 0 = no limit (open floor)
         self.max_minutes = int(d.get("max_minutes") or 0)     # 0 = no limit (open floor)
         self.started_at = d.get("started_at", 0.0)
@@ -451,13 +449,14 @@ class Session:
     def to_dict(self) -> dict:
         return {"title": self.title, "created": self.created, "repo": self.repo, "seats": self.seats,
                 "topic": self.topic, "extra": self.extra, "rounds": self.rounds, "readonly": self.readonly, "mode": self.mode,
-                "max_messages": self.max_messages, "max_minutes": self.max_minutes, "started_at": self.started_at, "framing": self.framing,
+                "max_messages": self.max_messages, "max_minutes": self.max_minutes, "started_at": self.started_at, "framing": self.framing, "referee": self.referee,
                 "transcript": self.transcript, "turn": self.turn, "status": self.status,
                 "rounds_done": self.rounds_done, "skipped": self.skipped,
                 "cli_sessions": self.cli_sessions, "last_seen": self.last_seen}
 
-    def save(self) -> None:
-        (self.dir / "session.json").write_text(json.dumps(self.to_dict(), indent=1), encoding="utf-8")
+    def save(self, transcript_md: bool = False) -> None:
+        (self.dir / "session.json").write_text(json.dumps(self.to_dict()), encoding="utf-8")
+        if not transcript_md: return
         md = [f"# {self.title or 'Conversation'}", f"Created: {self.created}", f"Folder: {self.repo}", "",
               "Agents:"] + [f"- {s['name']}: {s['provider']} ({s['model']})" for s in self.seats] + ["", f"Topic: {self.topic}", self.extra, ""]
         for e in self.transcript: md += [f"## Turn {e['turn']}: {e['speaker']} ({e['kind']})", "", e["text"], ""]
@@ -496,15 +495,36 @@ class Session:
         return seat.get("name") or f"{seat['provider']} ({seat['model']})"
 
 
+_SESS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
 def list_sessions() -> list[dict]:
+    """Parses a session.json only when its mtime changed, so polling stays cheap."""
     out = []
     for f in sorted(SESSIONS.glob("*/session.json"), reverse=True):
         try:
+            mt = f.stat().st_mtime; hit = _SESS_CACHE.get(str(f))
+            if hit and hit[0] == mt: out.append(hit[1]); continue
             d = json.loads(f.read_text(encoding="utf-8"))
-            out.append({"id": f.parent.name, "title": d.get("title") or " ".join(d.get("topic", "").split()[:8]) or "Untitled",
-                        "created": d.get("created", ""), "status": d.get("status", "idle"), "turns": len(d.get("transcript", []))})
+            meta = {"id": f.parent.name, "title": d.get("title") or " ".join(d.get("topic", "").split()[:8]) or "Untitled",
+                    "created": d.get("created", ""), "status": d.get("status", "idle"), "turns": len(d.get("transcript", []))}
+            _SESS_CACHE[str(f)] = (mt, meta); out.append(meta)
         except Exception: continue
     return out
+
+
+# ---------------------------------------------------------------- whispers
+def whisper_target(text: str) -> str | None:
+    """'WHISPER @Name: ...' at the start of a message makes it private to Name and the referee."""
+    import re as _re
+    m = _re.match(r"\s*WHISPER\s+@([A-Za-z][\w -]*?)\s*:", text, _re.I)
+    return m.group(1).strip() if m else None
+
+
+def can_see(entry: dict, viewer: str, referee: str) -> bool:
+    t = whisper_target(entry.get("text", ""))
+    if not t: return True
+    return viewer.lower() in (t.lower(), (referee or "").lower(), entry.get("speaker", "").lower())
 
 
 # ---------------------------------------------------------------- engine
@@ -513,7 +533,7 @@ class Run:
 
     def __init__(self, session: "Session", agora: "Agora") -> None:
         self.s = session; self.agora = agora
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.terms: list[dict] = []
         self.current: str | None = None
         self.procs: dict[int, subprocess.Popen] = {}
@@ -555,14 +575,16 @@ class Run:
 
 
     def _kill_tree(self) -> None:
-        for p in list(self.procs.values()):
-            if not p or p.poll() is not None: continue
+        """Kill every CLI this run started, all at once, without blocking the caller."""
+        def kill(p: subprocess.Popen) -> None:
             try:
-                if os.name == "nt": subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+                if os.name == "nt": subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=15)
                 else: os.killpg(os.getpgid(p.pid), 9)
             except Exception:
                 try: p.kill()
                 except Exception: pass
+        for p in list(self.procs.values()):
+            if p and p.poll() is None: threading.Thread(target=kill, args=(p,), daemon=True).start()
 
 
     def stop(self) -> None:
@@ -602,12 +624,13 @@ class Run:
             s = self.s; s.turn += 1
             color = next((x.get("color") for x in s.seats if s.label(x) == speaker), None)
             e = {"turn": s.turn, "speaker": speaker, "text": text, "kind": kind, "time": dt.datetime.now().strftime("%H:%M:%S"), "color": color}
-            s.transcript.append(e)
-            for i in range(len(s.seats)):  # every agent gets its own copy of the record
-                who = s.label(s.seats[i]); line = "You said" if speaker == who else f"{speaker} said"
-                with (s.seat_dir(i) / "memory.md").open("a", encoding="utf-8") as fh:
-                    fh.write(f"\n## Turn {e['turn']} ({e['time']}), {line}:\n{text}\n")
-            s.save()
+            s.transcript.append(e); seats = list(s.seats); ref = s.referee
+        for i, seat in enumerate(seats):  # every agent gets its own copy (whispers only to those allowed); outside the lock
+            who = s.label(seat); line = "You said" if speaker == who else f"{speaker} said"
+            if not can_see(e, who, ref): continue
+            with (s.seat_dir(i) / "memory.md").open("a", encoding="utf-8") as fh:
+                fh.write(f"\n## Turn {e['turn']} ({e['time']}), {line}:\n{text}\n")
+        s.save()
 
 
     def _prompt(self, i: int, seat: dict, instruction: str) -> str:
@@ -623,11 +646,11 @@ class Run:
             parts.append(f"You are {me}, running as {seat['provider']} with model {seat['model']}. The others: {others}.\n")
             if seat.get("stance"): parts.append(f"Your assigned stance or role: {seat['stance']}\n")
         parts.append(f"Your memory file (yours alone, full history of this conversation): {s.seat_dir(i) / 'memory.md'}\n")
-        seen = int(s.last_seen.get(str(i), 0)); new = s.transcript[seen:]
+        seen = int(s.last_seen.get(str(i), 0)); new = [e for e in s.transcript[seen:] if can_see(e, me, s.referee)]
         if new:
-            parts.append("Said since your last turn:\n")
+            parts.append(f"{len(new)} message(s) since your last turn, all of them new to you. " + ("These are things you saw and heard in the world; every ACTION below is something that person did, in front of you if you were there. Do not say nothing has happened; it has, and it is listed here:\n" if game else "Do not say nothing new has been said; it is listed here:\n"))
             for e in new: parts.append(f"--- {e['speaker']} (turn {e['turn']}) ---\n{e['text']}\n")
-        elif s.transcript: parts.append("Nothing new has been said since your last turn.\n")
+        elif s.transcript: parts.append("Nothing has happened since your last turn.\n" if game else "Nothing new has been said since your last turn.\n")
         parts.append(f"Your instruction now:\n{instruction}")
         return "\n".join(parts)
 
@@ -647,6 +670,7 @@ class Run:
 
     def _speak(self, i: int, seat: dict, instruction: str) -> str:
         s = self.s; who = s.label(seat); prov = PROVIDERS[seat["provider"]]
+        if self.stop_flag.is_set(): return f"[{who} was not asked: the conversation was stopped]"
         if shutil.which(prov["exe"]) is None:
             self._term(i, f"'{prov['exe']}' is not installed or not on PATH")
             return f"[{who} returned no answer. '{prov['exe']}' is not installed or not on PATH]"
@@ -706,14 +730,20 @@ class Run:
         last_speaker: int | None = None
         threads: dict[int, threading.Thread] = {}
         spoken = {i: sum(1 for e in s.transcript if e["speaker"] == s.label(seats[i]) and e["kind"] == "speech") for i in range(n)}
-        for i in range(n):
-            if not s.skipped[i]: queue[i] = "open"
-        prompted_at = {i: len(s.transcript) for i in range(n)}
+        ref_i = next((i for i, x in enumerate(seats) if s.referee and s.label(x).lower() == s.referee.lower()), None)
+        if ref_i is not None and not s.transcript:
+            queue[ref_i] = "open"                      # the referee opens; nobody acts before the world exists
+        else:
+            for i in range(n):
+                if not s.skipped[i]: queue[i] = "open"
+        last_end = {i: int(s.last_seen.get(str(i), 0)) for i in range(n)}   # where each seat's last prompt ended
 
         def mentioned(text: str) -> set[int]:
             hits = set()
             for i, x in enumerate(seats):
-                if re.search(r"@" + re.escape(s.label(x)) + r"\b", text, re.I): hits.add(i)
+                nm = re.escape(s.label(x))
+                if re.search(r"@" + nm + r"\b", text, re.I): hits.add(i)
+                elif s.framing == "game" and re.search(r"(?<![\w@])" + nm + r"\b", text, re.I): hits.add(i)   # named in an action or in talk
             return hits
 
         def worker(i: int, kind: str) -> None:
@@ -721,7 +751,6 @@ class Run:
             first = spoken[i] == 0 and (s.framing == "game" or not any(e["kind"] == "speech" for e in s.transcript))
             if s.framing == "game": instr = GAME_OPENING if first else GAME_REPLY
             else: instr = OPEN_OPENING if first else (OPEN_ADDRESSED if kind == "addressed" else OPEN_REPLY)
-            s.last_seen[str(i)] = prompted_at[i]
             text = self._speak(i, seat, instr)
             nonlocal last_speaker
             if text.strip().upper().rstrip(".") == "PASS" or text.strip().upper().startswith("PASS\n"):
@@ -737,10 +766,20 @@ class Run:
             self._record(s.label(seat), text, "speech"); spoken[i] += 1; last_speaker = i
             if closed["v"]: return
             with self.lock:
-                for j in range(n):
-                    if j != i and not s.skipped[j]: queue[j] = "addressed" if j in mentioned(text) else queue.get(j, "open")
-                for j in mentioned(text):
-                    if j != i: queue[j] = "addressed"
+                wt = whisper_target(text)
+                if ref_i is not None and i != ref_i:
+                    # a player spoke: wake the referee, plus anyone addressed (whisper target or @mention)
+                    queue[ref_i] = "open"
+                    for j in mentioned(text):
+                        if j != i and j != ref_i: queue[j] = "addressed"
+                    if wt:
+                        for j, x in enumerate(seats):
+                            if s.label(x).lower() == wt.lower() and j != i: queue[j] = "addressed"
+                else:
+                    for j in range(n):
+                        if j != i and not s.skipped[j]: queue[j] = "addressed" if j in mentioned(text) else queue.get(j, "open")
+                    for j in mentioned(text):
+                        if j != i: queue[j] = "addressed"
 
         seen_len = len(s.transcript); closed = {"v": False}
         while not self.stop_flag.is_set() and not self.vote_flag.is_set():
@@ -760,8 +799,14 @@ class Run:
                 newest = s.transcript[-1]
                 if newest["kind"] == "convener":
                     with self.lock:
-                        for j in range(n):
-                            if not s.skipped[j]: queue[j] = "addressed" if (j in mentioned(newest["text"]) or "To " not in newest["text"]) else queue.get(j, "open")
+                        ms = mentioned(newest["text"])
+                        if ref_i is not None and (ms or newest["text"].startswith("To ")):
+                            queue[ref_i] = "open"
+                            for j in ms:
+                                if not s.skipped[j]: queue[j] = "addressed"
+                        else:
+                            for j in range(n):
+                                if not s.skipped[j]: queue[j] = "addressed" if (j in ms or "To " not in newest["text"]) else queue.get(j, "open")
                 seen_len = len(s.transcript)
             # reap finished threads
             for i in [i for i, t in threads.items() if not t.is_alive()]: threads.pop(i)
@@ -775,7 +820,8 @@ class Run:
                     if j in threads or s.skipped[j]: queue.pop(j, None); continue
                     launch.append((j, queue.pop(j))); free -= 1
                 for j, kind in launch:
-                    prompted_at[j] = len(s.transcript)
+                    s.last_seen[str(j)] = last_end[j]          # prompt covers everything since this seat's previous prompt
+                    last_end[j] = len(s.transcript)
             for j, kind in launch:
                 t = threading.Thread(target=worker, args=(j, kind), daemon=True); threads[j] = t; t.start()
             # converged: nobody composing, nothing queued, everyone eligible has passed on the latest message
@@ -842,7 +888,7 @@ class Run:
                 self._record(s.label(seat), text, "system" if (text.startswith("[") and "returned no answer" in text) else "resolution")
         with self.lock:
             self.current = None; s.status = "stopped" if self.stop_flag.is_set() else "done"
-            s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(seats)); s.save()
+            s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(seats)); s.save(transcript_md=True)
         if s.status == "done": self._notify_finished()
 
 
@@ -852,7 +898,7 @@ class Agora:
 
     def __init__(self) -> None:
         SESSIONS.mkdir(exist_ok=True)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.runs: dict[str, Run] = {}
         first = self._open_latest()
         self.sid = first.id; self.runs[first.id] = Run(first, self)
@@ -881,20 +927,23 @@ class Agora:
 
     def busy(self) -> bool: return self.run.busy()
 
-    def snapshot(self) -> dict:
+    def snapshot(self, since: int = -1, terms: bool = False, tail: int = 150) -> dict:
+        """Light by default: transcript only after `since` (turn), terminal tails only when asked. Lock held only to copy."""
         r = self.run
         with r.lock:
             s = r.s
             live = [rid for rid, x in self.runs.items() if x.busy()]
-            return {"id": s.id, "title": s.title, "seats": s.seats, "topic": s.topic, "extra": s.extra,
+            tr = [e for e in s.transcript if e["turn"] > since] if since >= 0 else list(s.transcript)
+            tstates = [{"state": t["state"], "count": t["count"], "lines": list(t["lines"])[-tail:] if terms else []} for t in r.terms]
+            return {"id": s.id, "title": s.title, "seats": list(s.seats), "topic": s.topic, "extra": s.extra, "transcript_total": len(s.transcript), "last_turn": s.turn,
                     "rounds": s.rounds, "readonly": s.readonly, "mode": s.mode,
-                    "max_messages": s.max_messages, "max_minutes": s.max_minutes, "started_at": s.started_at, "framing": s.framing, "transcript": s.transcript, "status": s.status,
+                    "max_messages": s.max_messages, "max_minutes": s.max_minutes, "started_at": s.started_at, "framing": s.framing, "referee": s.referee, "transcript": tr, "status": s.status,
                     "current": r.current, "turn": s.turn, "repo": s.repo, "repo_ok": Path(s.repo).is_dir(),
                     "rounds_done": s.rounds_done, "sessions": list_sessions(), "live": live,
-                    "terms": [{"state": t["state"], "count": t["count"], "lines": list(t["lines"])} for t in r.terms],
+                    "terms": tstates,
                     "phone_url": self.phone_url, "away_url": self.away_url, "last_tg": self.last_tg,
                     "tg_ready": bool((tg_config().get("token") or "").strip()),
-                    "templates": list(TEMPLATES.keys()), "user_templates": list(user_templates().keys()), "sessions_dir": str(SESSIONS),
+                    "templates": list(TEMPLATES.keys()), "user_templates": list(user_templates().keys()), "sessions_dir": str(SESSIONS), "build": BUILD,
                     "providers": {k: {"models": v["models"], "installed": shutil.which(v["exe"]) is not None,
                                       "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
                                       "version": VERSIONS.get(k, {}).get("installed", ""), "latest": VERSIONS.get(k, {}).get("latest", "")}
@@ -978,10 +1027,12 @@ class Agora:
             if "readonly" in d: s.readonly = bool(d["readonly"])
             if d.get("mode") in ("turns", "open"): s.mode = d["mode"]
             if d.get("framing") in ("council", "game"): s.framing = d["framing"]
+            if "referee" in d: s.referee = (d["referee"] or "").strip()
             if "max_messages" in d: s.max_messages = max(0, int(d["max_messages"] or 0))
             if "max_minutes" in d: s.max_minutes = max(0, int(d["max_minutes"] or 0))
             if d.get("repo"): s.repo = d["repo"]
             if not s.title: s.title = " ".join(s.topic.split()[:8])
+            if s.framing == "game" and not s.referee and any(s.label(x).lower() == "world" for x in s.seats): s.referee = next(s.label(x) for x in s.seats if s.label(x).lower() == "world")
             s.save()
 
 
@@ -1165,6 +1216,7 @@ textarea{line-height:1.55}
   <div class="field"><label>Topic</label><textarea id="topic"></textarea></div>
   <div class="field"><label>Extra instructions (optional)</label><textarea id="extra" style="min-height:70px" placeholder="Anything else they must do, avoid, or produce"></textarea></div>
   <div class="field"><label>What this is</label><div class="row"><button class="btn" id="frCouncil" style="flex:1">Council</button><button class="btn" id="frGame" style="flex:1">Game</button></div><div class="note" style="margin-top:6px" id="frNote"></div></div>
+  <div class="field" id="refField"><label>Referee (the World)</label><select id="referee"><option value="">None</option></select><div class="note" style="margin-top:6px">Only the referee's messages wake everyone. Players wake the referee and whoever they @mention or whisper to. The referee speaks first.</div></div>
   <div class="field"><label>How they speak</label><div class="row" id="modeRow"><button class="btn" data-m="turns" id="modeTurns" style="flex:1">Take turns</button><button class="btn" data-m="open" id="modeOpen" style="flex:1">Open floor</button></div><div class="note" id="modeNote" style="margin-top:6px"></div></div>
   <div class="two" id="limits"><div class="field"><label>Close the floor after this many messages</label><input id="maxMsgs" type="number" min="0" placeholder="no limit"></div><div class="field"><label>Or after this many minutes</label><input id="maxMins" type="number" min="0" placeholder="no limit"></div></div>
   <div class="two"><div class="field"><label id="roundsLabel">Rounds</label><input id="rounds" type="number" min="1"><div class="note" id="roundsNote" style="margin-top:6px">Each agent speaks once per round, then gives a closing statement.</div></div>
@@ -1189,6 +1241,7 @@ textarea{line-height:1.55}
   <div class="kv" id="termRow"><span>Terminals</span><button class="btn sm" id="termBtn">Show or hide</button></div>
   <div class="kv"><span>Panel sizes</span><button class="btn sm" id="layoutReset">Reset to defaults</button></div></section>
  <section class="sg"><h2>Agora</h2>
+  <div class="kv"><span>Build</span><code id="buildTag"></code></div>
   <div class="kv"><span>Conversations folder</span><code id="sessDir"></code></div>
   <div class="row" style="margin-top:10px"><button id="quit" class="danger solid">Quit Agora</button><span class="note">Kills every CLI Agora started and closes the server. Conversations are kept.</span></div></section>
 </div></div>
@@ -1197,7 +1250,8 @@ textarea{line-height:1.55}
 <div id="picker"><div class="box"><b>Choose a folder</b><div class="row"><input id="pkPath"><button id="pkUp" class="btn">Up</button></div><ul id="pkList"></ul><div class="row" style="justify-content:flex-end"><button id="pkCancel" class="btn">Cancel</button><button id="pkUse" class="primary">Use this folder</button></div></div></div>
 
 <script>
-let S=null,editing=false,providers={},termKey='',menuOpen=false,seatsLocked=null;
+let S=null,editing=false,providers={},termKey='',menuOpen=false,seatsLocked=null;let T=[],lastTurn=-1,Tid=null;
+function mergeTranscript(s){if(s.id!==Tid||s.transcript_total<T.length){T=s.transcript?s.transcript.slice():[];Tid=s.id}else if(s.transcript)for(const e of s.transcript)if(e.turn>lastTurn)T.push(e);lastTurn=T.length?T[T.length-1].turn:-1;s.transcript=T}
 const $=id=>document.getElementById(id);
 async function api(p,b){const r=await fetch(p,{method:b?'POST':'GET',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):null});return r.json()}
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
@@ -1240,7 +1294,7 @@ function renderTerms(s){const started=s.transcript.length>0||['running','voting'
  s.terms.forEach((t,i)=>{const el=$('t'+i);if(!el)return;const seat=s.seats[i]||{};el.style.setProperty('--c',seat.color||'#22D3EE');
   el.querySelector('.nm').innerHTML=`<span class="av ${t.state==='speaking'?'on':''}">${esc((lbl(seat)||'?')[0])}</span> <b>${esc(lbl(seat))}</b><span>${esc((seat.provider||'')+' · '+(seat.model||''))}</span>`;
   el.classList.toggle('speaking',t.state==='speaking');el.querySelector('.st').textContent=t.state==='speaking'?'Speaking':'';
-  const pre=el.querySelector('pre');const atBottom=pre.scrollHeight-pre.scrollTop-pre.clientHeight<40;if(pre.dataset.count!=t.count){pre.textContent=t.lines.length?t.lines.join('\n'):'No live output yet. This pane fills when the agent next speaks. Earlier turns are in the conversation and in the agent\'s memory file.';pre.style.color=t.lines.length?'':'var(--faint)';pre.dataset.count=t.count;if(atBottom)pre.scrollTop=pre.scrollHeight}})}
+  const pre=el.querySelector('pre');const atBottom=pre.scrollHeight-pre.scrollTop-pre.clientHeight<40;if(pre.dataset.count!=t.count&&t.lines.length){pre.textContent=t.lines.join('\n');pre.style.color='';pre.dataset.count=t.count;if(atBottom)pre.scrollTop=pre.scrollHeight}else if(!pre.textContent){pre.textContent='No live output yet. This pane fills when the agent next speaks.';pre.style.color='var(--faint)'}})}
 function renderHist(s){const live=new Set(s.live||[]);$('railCount').textContent=s.sessions.length;const item=h=>`<div class="hitem ${h.id===s.id?'on':''}" data-id="${h.id}" tabindex="0" role="button"><div class="t"><span>${live.has(h.id)?'<span class="livedot"></span>':''}${esc(h.title)}</span><button class="del" data-id="${h.id}" aria-label="Delete conversation ${esc(h.title)}" title="Delete">&times;</button></div><div class="m">${esc(h.created.replace('T',' '))} · ${h.turns?h.turns+' turns':'draft'}</div></div>`;
  const L=s.sessions.filter(h=>live.has(h.id)),E=s.sessions.filter(h=>!live.has(h.id));
  $('hlist').innerHTML=(L.length?'<div class="hsec">Live now</div>'+L.map(item).join(''):'')+(E.length?'<div class="hsec">'+(L.length?'Earlier':'All')+'</div>'+E.map(item).join(''):'');
@@ -1249,7 +1303,7 @@ function renderHist(s){const live=new Set(s.live||[]);$('railCount').textContent
 function renderVers(s){$('vers').innerHTML=Object.entries(s.providers).map(([k,p])=>{if(p.isolated)return `<div>${esc(k)}: runs the newest Codex release, downloaded on first use, without touching your installed Codex.</div>`;
  const inst=p.installed?(p.version||'installed'):'not installed';const up=p.latest&&p.version&&!p.version.includes(p.latest);
  return `<div class="row"><span>${esc(k)}: <b style="color:var(--text)">${esc(inst)}</b>${p.latest?' · latest '+esc(p.latest):''}${up?' <span style="color:var(--faint)">(Agora never updates installed CLIs)</span>':''}</span></div>`}).join('')}
-function render(s){const first=!S||S.id!==s.id;S=s;providers=s.providers;
+function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1}mergeTranscript(s);S=s;providers=s.providers;
  const busy=['running','voting'].includes(s.status);const paused=s.status==='paused';const started=s.transcript.length>0||busy||paused;
  $('hdrTitle').textContent=s.title||'';
  const who=s.current?s.current.split(', '):[];const whoTxt=who.length>2?`<b>${who.length} agents</b>`:`<b>${esc(s.current||'')}</b>`;
@@ -1265,6 +1319,7 @@ function render(s){const first=!S||S.id!==s.id;S=s;providers=s.providers;
  const game=s.framing==='game';$('frCouncil').classList.toggle('on',!game);$('frGame').classList.toggle('on',game);$('frCouncil').disabled=busy;$('frGame').disabled=busy;$('frNote').textContent=game?'Characters with fixed stats. Words persuade, only the World changes numbers, every message ends with one ACTION line. Seat one agent named World with the referee stance.':'Agents debate the topic, cite the folder, and give closing statements.';
  const open=s.mode==='open';$('modeTurns').classList.toggle('on',!open);$('modeOpen').classList.toggle('on',open);$('modeTurns').disabled=busy;$('modeOpen').disabled=busy;
  $('modeNote').textContent=(s.framing==='game'?'Game framing: characters with fixed stats, the World referees. ':'')+(open?'No turns. Every message goes to everyone at once and each agent replies or passes. Use @Name to demand an answer. The floor closes when everyone passes, when a limit below is hit, or when you press End.':'Agents speak one after another in seat order.');
+ $('refField').style.display=game?'':'none';const ropts='<option value="">None</option>'+s.seats.map(x=>`<option value="${esc(lbl(x))}" ${lbl(x)===s.referee?'selected':''}>${esc(lbl(x))}</option>`).join('');if($('referee').innerHTML!==ropts)$('referee').innerHTML=ropts;$('referee').value=s.referee||'';
  $('rounds').closest('.field').style.display=open?'none':'';$('limits').style.display=open?'':'none';$('maxMsgs').disabled=false;$('maxMins').disabled=false;$('endBtn').style.display=(busy&&open)?'':'none';
  $('roundsNote').textContent=started?`${s.rounds_done} round(s) done. Continue adds this many more.`:'Each agent speaks once per round, then gives a closing statement.';
  $('repo').disabled=started;$('browse').disabled=started;$('ro').disabled=busy||paused;
@@ -1278,14 +1333,17 @@ function render(s){const first=!S||S.id!==s.id;S=s;providers=s.providers;
  if(!mobile()){$('setup').style.display=started||busy?'none':'block';$('chat').style.display=started||busy?'block':'none';$('composer').style.display=started||busy?'':'none';document.body.classList.toggle('autoterm',!(started||busy))}
  $('chatEmpty').style.display=s.transcript.length?'none':'block';
  const chatEl=$('chat');const atBottom=first||(chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight<80);
- if(first||$('msgs').children.length!==s.transcript.length){$('msgs').innerHTML=s.transcript.map(e=>`<div class="msg ${e.kind}" style="${e.color?'--c:'+esc(e.color):''}"><div class="hd"><span class="av">${esc((e.speaker||'?')[0])}</span><span class="who">${esc(e.speaker)}</span>${e.kind==='resolution'?'<span class="tag">closing statement</span>':''}<span class="meta">turn ${e.turn} · ${e.time}</span></div><div class="body">${rich(e.text)}</div></div>`).join('');if(atBottom)chatEl.scrollTop=chatEl.scrollHeight}
+ const msgHtml=e=>`<div class="msg ${e.kind}" style="${e.color?'--c:'+esc(e.color):''}"><div class="hd"><span class="av">${esc((e.speaker||'?')[0])}</span><span class="who">${esc(e.speaker)}</span>${e.kind==='resolution'?'<span class="tag">closing statement</span>':''}<span class="meta">turn ${e.turn} · ${e.time}</span></div><div class="body">${rich(e.text)}</div></div>`;
+ const have=$('msgs').children.length;
+ if(first||have>s.transcript.length){$('msgs').innerHTML=s.transcript.map(msgHtml).join('');chatEl.scrollTop=chatEl.scrollHeight}
+ else if(have<s.transcript.length){const atB=chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight<120;$('msgs').insertAdjacentHTML('beforeend',s.transcript.slice(have).map(msgHtml).join(''));if(atB)chatEl.scrollTop=chatEl.scrollHeight}
  $('typing').style.display=s.current?'flex':'none';$('typing').textContent=s.current?(who.length>3?who.length+' agents':s.current)+(paused?' finishing, then the conversation pauses':(who.length>1?' are writing':' is writing')):'';
  renderTerms(s)}
 function showTab(t){if(t==='settings'){openSettings();document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));return}$('settings').classList.remove('open');['chat','terms','setup','rail'].forEach(id=>$(id).classList.toggle('on',id===t));document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));if(mobile()){$('center').style.display=(t==='chat'||t==='setup')?'flex':'none';$('composer').style.display=t==='chat'?'':'none';$('setup').style.display=t==='setup'?'block':'none';$('chat').style.display=t==='chat'?'block':'none'}}
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.t));if(mobile())showTab('chat');
 $('railBtn').onclick=()=>document.body.classList.toggle('norail');$('termBtn').onclick=()=>{document.body.classList.toggle('noterm')};
 $('gearBtn').onclick=()=>openSettings();$('settingsClose').onclick=()=>{$('settings').classList.remove('open');if(mobile())showTab('chat')};
-function openSettings(){if(S){$('awayUrl').textContent=S.away_url||'not available (install Tailscale on this PC and your phone)';$('homeUrl').textContent=S.phone_url||'not available';$('sessDir').textContent=S.sessions_dir||''}$('settings').classList.add('open')}
+function openSettings(){if(S){$('awayUrl').textContent=S.away_url||'not available (install Tailscale on this PC and your phone)';$('homeUrl').textContent=S.phone_url||'not available';$('sessDir').textContent=S.sessions_dir||'';$('buildTag').textContent=S.build||''}$('settings').classList.add('open')}
 document.querySelectorAll('.cp').forEach(b=>b.onclick=async()=>{const t=$(b.dataset.for).textContent;if(!t.startsWith('http'))return;try{await navigator.clipboard.writeText(t);b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1200)}catch(e){prompt('Copy this link',t)}});
 $('menuBtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open')};function closeMenu(){$('menu').classList.remove('open')}document.addEventListener('click',e=>{if(!$('menu').contains(e.target))closeMenu()});
 // details sheet: move the setup form in and out
@@ -1305,7 +1363,7 @@ $('start').onclick=async()=>{await save();render(await api('/start',{}));$('shee
 $('pause').onclick=async()=>render(await api('/pause',{}));
 $('vote').onclick=async()=>{closeMenu();render(await api('/vote',{}))};
 [['expClosing','closing'],['expSpeeches','speeches'],['expAll','all']].forEach(([id,w])=>$(id).onclick=()=>{closeMenu();if(S)window.location='/export?what='+w+'&id='+encodeURIComponent(S.id)});$('endBtn').onclick=async()=>{if(confirm('End the open floor now? Agents still composing will finish, then everyone gives a closing statement.'))render(await api('/vote',{}))};
-$('stop').onclick=async()=>{closeMenu();if(confirm('Stop this conversation? The transcript is kept and you can continue it later.'))render(await api('/stop',{}))};
+$('stop').onclick=async()=>{closeMenu();if(!confirm('Stop this conversation? The transcript is kept and you can continue it later.'))return;$('statusText').textContent='Stopping...';render(await api('/stop',{}))};
 $('quit').onclick=async()=>{if(!confirm('Quit Agora? This kills every CLI it started and closes the server. Conversations are kept.'))return;try{await api('/shutdown',{})}catch(e){}document.body.innerHTML='<div style="padding:40px;color:#8B8B94">Agora is closed. You can close this tab.</div>'};
 $('sayBtn').onclick=async()=>{const t=$('sayText').value.trim();if(!t)return;$('sayText').value='';hlSync();render(await api('/say',{text:t,target:$('sayTo').value}))};
 let acItems=[],acIdx=0,acStart=-1;
@@ -1327,7 +1385,7 @@ $('sayText').onkeydown=e=>{const open=$('ac').classList.contains('open');
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('sayBtn').click()}};
 $('tg').onclick=async()=>{$('tgState').textContent='Sending...';const r=await api('/telegram',{});$('tgState').textContent=r.last_tg||'No response'};
 let saveTimer=null;['title','repo','topic','extra','rounds','maxMsgs','maxMins'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
-$('ro').onchange=save;$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
+$('ro').onchange=save;$('referee').onchange=async()=>render(await api('/config',{referee:$('referee').value}));$('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('frCouncil').onclick=async()=>render(await api('/config',{framing:'council'}));$('frGame').onclick=async()=>render(await api('/config',{framing:'game'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
 let pk={path:''};
 async function openPk(p){const d=await api('/ls?path='+encodeURIComponent(p||$('repo').value));pk=d;$('pkPath').value=d.path;
  const sep=d.path.includes('\\')?'\\':'/';const base=d.path.replace(/[\\/]$/,'');
@@ -1346,7 +1404,8 @@ function drag(e,el,fn){e.preventDefault();el.classList.add('drag');el.setPointer
 $('fsUp').onclick=()=>{LAY.fs=Math.min(20,(LAY.fs||14)+1);applyLayout();saveLayout()};$('fsDown').onclick=()=>{LAY.fs=Math.max(11,(LAY.fs||14)-1);applyLayout();saveLayout()};
 $('layoutReset').onclick=()=>{for(const k of Object.keys(LAY))delete LAY[k];localStorage.removeItem('agora-layout');const r=document.documentElement.style;['--rail','--terms','--fs','--tfs'].forEach(v=>r.removeProperty(v))};
 applyLayout();bindGrips();
-(async function poll(){try{render(await api('/state'))}catch(e){}setTimeout(poll,1500)})();
+function wantTerms(){const noterm=document.body.classList.contains('noterm')||document.body.classList.contains('autoterm');return mobile()?$('terms').classList.contains('on'):!noterm}
+(async function poll(){try{render(await api('/state?since='+(S?lastTurn:-1)+'&terms='+(wantTerms()?1:0)))}catch(e){}setTimeout(poll,1500)})();
 </script></body></html>"""
 
 
@@ -1369,7 +1428,10 @@ def make_handler(agora: Agora, token: str):
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return False
         def do_GET(self):
             if not self._authed(): return
-            if self.path == "/state": return self._send(json.dumps(agora.snapshot()).encode(), "application/json")
+            if self.path.startswith("/state"):
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                return self._send(json.dumps(agora.snapshot(since=int(q.get("since", ["-1"])[0]), terms=q.get("terms", ["0"])[0] == "1")).encode(), "application/json")
             if self.path.startswith("/export"):
                 from urllib.parse import parse_qs, urlparse
                 q = parse_qs(urlparse(self.path).query); what = q.get("what", ["all"])[0]; sid = q.get("id", [agora.s.id])[0]
@@ -1397,7 +1459,8 @@ def make_handler(agora: Agora, token: str):
              "/template/save": lambda: agora.save_template(data.get("name", "")),
              "/template/delete": lambda: delete_user_template(data.get("name", "")),
              "/telegram": agora.send_link}.get(self.path, lambda: None)()
-            self._send(json.dumps(agora.snapshot()).encode(), "application/json")
+            full = self.path in ("/session/open", "/session/new", "/session/delete", "/template")
+            self._send(json.dumps(agora.snapshot(since=-1 if full else 10**9)).encode(), "application/json")
     return H
 
 
@@ -1423,6 +1486,7 @@ def main() -> int:
             except Exception: ts = ""
     agora.phone_url = f"http://{lan}:{a.port}/?token={token}" if lan else ""
     agora.away_url = f"http://{ts}:{a.port}/?token={token}" if ts else ""
+    print(f"Agora build {BUILD}")
     print(f"Agora (desktop):            {url}")
     if agora.phone_url: print(f"Agora (phone, home wifi):   {agora.phone_url}")
     if agora.away_url:  print(f"Agora (phone, anywhere via Tailscale): {agora.away_url}")
