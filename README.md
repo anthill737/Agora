@@ -63,7 +63,7 @@ Each row offers only what it needs:
 
 Nothing is offered when a CLI is connected.
 
-Agora connects a CLI one way only: that CLI's own sign-in. There is no API key field anywhere, Agora holds no key, and it passes no key to the CLIs it starts. A token already in this machine's environment, such as `GH_TOKEN` for Copilot CLI or `GEMINI_API_KEY` for Gemini CLI, is read but never written: those CLIs use such a token ahead of any saved sign-in, so the row says so rather than reporting a state the CLI will not use.
+Agora connects a CLI one way only: that CLI's own sign-in. Nothing else is asked for, held, or passed to the CLIs it starts.
 
 Connection state appears in exactly one other place: pressing Start with a seat whose CLI is not connected does not start the conversation and puts a single line under the header naming the CLI, with a link into Connections.
 
@@ -76,7 +76,7 @@ Each agent is started with your own environment, adjusted in a few ways that mat
 - **The installers' folders are on `PATH`.** A CLI installed after Agora started is not on the PATH this process captured at launch, so Agora also looks in `~/.local/bin`, the npm prefix, Homebrew, nvm, volta, fnm, and its own `agora_tools`.
 - **No colour codes, no stdin, no auto-update.** Agents get `NO_COLOR=1`, an empty stdin so nothing waits for a keypress, and Claude's auto-updater off so twenty seats do not all try to update at once.
 
-Things Agora cannot fix, which the Connections rows warn about when they are true: `ANTHROPIC_API_KEY` in the environment, which Claude Code always prefers over your login in non-interactive mode; Agora started over SSH on a Mac, where the Keychain holding the Claude login is locked; and `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX`, which send Claude somewhere else entirely.
+Things Agora cannot fix, which the Connections rows warn about when they are true: Agora started over SSH on a Mac, where the Keychain holding the Claude login is locked; and `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX`, which send Claude somewhere else entirely.
 
 ## How a conversation works
 

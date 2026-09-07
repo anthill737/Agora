@@ -168,23 +168,19 @@ def env_warnings(provider: str) -> list[list[str]]:
     """[level, text] notes about this machine's environment that change how a CLI will behave when Agora runs it."""
     w: list[list[str]] = []; e = os.environ
     if provider == "Claude Code":
-        if e.get("ANTHROPIC_API_KEY"):
-            w.append(["warn", "ANTHROPIC_API_KEY is set in Agora's environment. In non-interactive mode Claude Code always uses that key instead of your login, so Claude seats bill the key and fail if it is invalid. Unset it before starting Agora to use your login."])
-        if e.get("ANTHROPIC_AUTH_TOKEN") or e.get("ANTHROPIC_BASE_URL"):
-            w.append(["warn", "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_BASE_URL is set, so Claude Code will send requests to that endpoint with that token, not to Anthropic with your login."])
+        if e.get("ANTHROPIC_BASE_URL"):
+            w.append(["warn", "ANTHROPIC_BASE_URL is set, so Claude Code will send requests to that endpoint, not to Anthropic with your login."])
         if e.get("CLAUDE_CODE_USE_BEDROCK") or e.get("CLAUDE_CODE_USE_VERTEX"):
             w.append(["warn", "CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set: Claude Code will use that cloud provider, and OAuth login is not available there."])
         if sys.platform == "darwin" and e.get("SSH_CONNECTION"):
             w.append(["warn", "Agora was started over SSH. On macOS, Claude Code keeps its login in the Keychain, which is locked for SSH sessions, so Claude seats cannot read it. Start Agora from a terminal on the Mac itself."])
         if e.get("CLAUDECODE"):
             w.append(["info", "Agora was started from inside a Claude Code session. Agora removes that marker for its agents, otherwise Claude seats would hang at startup."])
-    if provider == "Copilot CLI" and not any(e.get(k) for k in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
-        w.append(["info", "Uses the login saved by 'copilot login'. A GH_TOKEN in the environment would take precedence."])
     return w
 
 
 _GATES: dict[str, threading.Lock] = {k: threading.Lock() for k in PROVIDERS}   # one start at a time per gated provider
-_AUTH_RE = re.compile(r"oauth|not logged in|/login\b|log in|authenticat|unauthori[sz]ed|\b401\b|invalid api key|token.{0,30}(expired|refresh|revoked)|please run .?claude.?\s*(auth|login)", re.I)
+_AUTH_RE = re.compile(r"oauth|not logged in|/login\b|log in|authenticat|unauthori[sz]ed|\b401\b|token.{0,30}(expired|refresh|revoked)|please run .?claude.?\s*(auth|login)", re.I)
 
 
 def decode_out(b: bytes) -> str:
@@ -207,7 +203,7 @@ def auth_hint(provider: str, text: str) -> str:
              "one of them may have rotated the login token; Agora starts Claude seats one at a time so its own seats do not do that to each other.")
         if sys.platform == "darwin" and os.environ.get("SSH_CONNECTION"): h += " Agora is running over SSH, where the macOS Keychain that holds the login is locked."
         return h
-    if provider == "Copilot CLI": return "Copilot CLI is not logged in for this user. Run 'copilot login' in a terminal, or set GH_TOKEN."
+    if provider == "Copilot CLI": return "Copilot CLI is not logged in for this user. Run 'copilot login' in a terminal."
     if provider in ("Codex", "Codex (latest)"): return "Codex is not logged in. Run 'codex login' in a terminal."
     if provider == "OpenCode": return "OpenCode has no credentials for that model. Run 'opencode auth login'."
     if provider == "Gemini CLI": return "Gemini CLI is not logged in. Run 'gemini' in a terminal and finish the sign-in."
@@ -664,10 +660,7 @@ def tool_dirs() -> list[Path]:
     return d
 
 
-# Agora connects a CLI one way only: that CLI's own sign-in. It never asks for, holds, or passes an API key.
-# The names below are read, never written: a token already in this machine's environment changes how the CLI
-# behaves, so the row says so rather than reporting a state that is not the one the CLI will use.
-COPILOT_ENV = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+# Agora connects a CLI one way only: that CLI's own sign-in. Nothing else is asked for, held, or passed on.
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[=>()][0-9A-Za-z]?|[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
@@ -720,17 +713,16 @@ def probe_codex_files() -> tuple[str, str]:
     try: d = json.loads(f.read_text(encoding="utf-8"))
     except Exception: return "unknown", f"{f} cannot be read."
     if d.get("auth_mode") == "chatgpt" or d.get("tokens"): return "on", "Signed in with a ChatGPT account."
-    if d.get("auth_mode") == "api_key" or d.get("OPENAI_API_KEY"): return "off", CODEX_API_KEY_NOTE
-    return "off", "Not signed in."
+    return "off", CODEX_SIGNIN_NOTE
 
 
 def probe_codex(exe: str) -> tuple[str, str]:
     """'codex login status' prints how it is signed in, and fails when it is not."""
     rc, out = _probe([exe, "login", "status"], 45)
     line = " ".join(out.split())[:140]; low = out.lower()
-    if "api key" in low: return "off", CODEX_API_KEY_NOTE
     if "not logged in" in low: return "off", "Not signed in."
-    if rc == 0 and "logged in" in out.lower(): return "on", line
+    if rc == 0 and "logged in" in low and "chatgpt" not in low: return "off", CODEX_SIGNIN_NOTE
+    if rc == 0 and "logged in" in low: return "on", line
     if rc == 0 and line: return "on", line
     if rc != 0 and not line: return "off", "Not signed in."
     return "unknown", line or "'codex login status' gave no answer."
@@ -746,8 +738,6 @@ def probe_opencode(exe: str) -> tuple[str, str]:
 
 
 def probe_gemini(exe: str) -> tuple[str, str]:
-    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        if os.environ.get(k): return "on", f"This machine's environment has {k}, which Gemini CLI uses ahead of any saved sign-in."
     rc, out = _probe([exe, "auth", "status"], 30)
     low = out.lower()
     if rc == 0 and ("authenticated" in low or "signed in" in low or "logged in" in low): return "on", " ".join(out.split())[:140]
@@ -758,10 +748,8 @@ def probe_gemini(exe: str) -> tuple[str, str]:
 
 
 def probe_copilot(exe: str) -> tuple[str, str]:
-    """Copilot CLI has no sign-in status command and keeps its token in the operating system credential store,
-    which Agora cannot read. An environment token is a definite answer; otherwise only a real request can tell."""
-    for k in COPILOT_ENV:
-        if os.environ.get(k): return "on", f"This machine's environment has {k}, which Copilot CLI uses ahead of any saved sign-in."
+    """Copilot CLI has no sign-in status command and keeps its login in the operating system credential store,
+    which Agora cannot read, so only a real request can tell."""
     t = TESTS.get("Copilot CLI")
     if t and t.get("ok"): return "on", f"Answered a test prompt at {t.get('when', '')}."
     if t and not t.get("ok"): return "off", (t.get("hint") or t.get("text") or "The check failed.")
@@ -833,8 +821,7 @@ CODEX_PROVIDERS = ("Codex", "Codex (latest)")
 CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 CODEX_BACKUP = HERE.with_name("agora_codex_auth.bak")
 CODEX_PRIME_TTL = 1500.0     # re-prime if the last one is older than this, so a stale access token is refreshed alone
-CODEX_API_KEY_NOTE = ("Signed in with an API key. Agora drives Codex through the ChatGPT subscription sign-in, so press "
-                      "Sign in and choose your ChatGPT account.")
+CODEX_SIGNIN_NOTE = "Not signed in with a ChatGPT account. Press Sign in and choose your ChatGPT account."
 _prime_lock = threading.Lock()
 _LAST_PRIME: dict[str, float] = {}
 
