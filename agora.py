@@ -83,14 +83,14 @@ PROVIDERS = {
         "cmd": 'npx -y @openai/codex@latest exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
         "ro_cmd": 'npx -y @openai/codex@latest exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
         "resume": "",
-        "models": ["gpt-6-astra", "gpt-6-astra-pro", "gpt-5.6", "gpt-5.5"],
+        "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"], "default": "gpt-5.6-luna",
     },
     "Codex": {
         "exe": "codex", "speech": "stdout", "pkg": "@openai/codex",
         "cmd": 'codex exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
         "resume": "",
         "ro_cmd": 'codex exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
-        "models": ["gpt-6-astra", "gpt-6-astra-pro", "gpt-5.6", "gpt-5.5"],
+        "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"], "default": "gpt-5.6-luna",
     },
     "OpenCode": {
         "exe": "opencode", "speech": "stdout", "pkg": "opencode-ai",
@@ -359,9 +359,10 @@ def default_model(provider: str) -> str:
 
 
 def seat_model(provider: str) -> str:
-    """What a new seat is given: the model that answered the probe. Before any answer the first listed name stands
-    in, and Start's preflight checks it before anything is launched."""
-    return default_model(provider) or PROVIDERS[provider]["models"][0]
+    """What a new seat is given: the provider's chosen default when it has one (Codex seats default to gpt-5.6-luna),
+    else the model that answered the probe. Before any answer the first listed name stands in, and Start's preflight
+    checks it before anything is launched."""
+    return PROVIDERS[provider].get("default") or default_model(provider) or PROVIDERS[provider]["models"][0]
 
 
 def provider_gate(provider: str):

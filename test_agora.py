@@ -149,7 +149,7 @@ class Classify(unittest.TestCase):
         self.assertEqual(c("401 Unauthorized: missing bearer token"), "launcher")
         self.assertEqual(c("no credentials found in the request"), "launcher")
         self.assertEqual(c("stream disconnected"), "other")
-        self.assertEqual(c("gpt-5.5 answered in 5.01 s"), "other")   # version-like numbers are not status codes
+        self.assertEqual(c("gpt-5.6-luna answered in 5.01 s"), "other")   # version-like numbers are not status codes
 
 
 class Launcher(Base):
@@ -349,6 +349,9 @@ class Connections(Base):
         self.assertEqual(c["state"], "on"); self.assertEqual(c["model"], "ok")
         self.assertIn("ok answered a one-word request at", c["detail"]); self.assertTrue(c["version"])
         self.assertEqual(agora.default_model("Stub"), "ok"); self.assertEqual(agora.seat_model("Stub"), "ok")
+        for p in ("Codex", "Codex (latest)"):
+            self.assertEqual(agora.seat_model(p), "gpt-5.6-luna", "Codex seats default to luna")
+            self.assertEqual(agora.PROVIDERS[p]["models"], ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"])
         self.assertEqual(agora.connections()["Stub"]["default_model"], "ok")
 
     def test_nothing_is_assumed_before_a_probe(self) -> None:
