@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # the folder offered when a conversation chooses "A folder I choose"
-BUILD = "2026-09-07.1"
+BUILD = "2026-09-07.2"
 TURN_TIMEOUT = 1800      # wall clock: a turn is killed after this many seconds, whatever it is still printing
 IDLE_TIMEOUT = 300       # a turn that prints nothing at all for this long is killed
 PROBE_TIMEOUT = 240      # one tiny request, as a probe or a priming prompt, gets this long in total
@@ -66,6 +66,12 @@ ASK = "Read the file {prompt_file} and respond exactly as it instructs. Your fin
 SESSIONS = HERE.with_name("agora_sessions")
 TAIL = 400
 
+CODEX_EFFORT = '-c model_reasoning_effort="low"'   # on every Codex launch, so a seat never inherits the user's config.toml
+CODEX_MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"]
+CODEX_DEFAULT = "gpt-5.6-luna"
+OLD_CODEX_MODELS = {"gpt-5.5", "gpt-5.6", "gpt-5.4", "gpt-6-astra-pro", "gpt-5.5-codex", "gpt-5.4-codex", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex",
+                    "gpt-5-codex", "gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.3", "gpt-5.1-codex-mini", "gpt-5.3-codex-mini", "o3", "o4-mini", "codex-mini-latest"}
+
 # Provider definitions. Never shown in the UI.
 #   cmd: {ask}, {model} and {seat_dir} (the agent's own folder with its prompt and memory files) are filled in.
 #   speech: how the finished speech is extracted from the run.
@@ -80,17 +86,17 @@ PROVIDERS = {
     },
     "Codex (latest)": {
         "exe": "npx", "speech": "stdout", "pkg": "@openai/codex", "isolated": True,
-        "cmd": 'npx -y @openai/codex@latest exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
-        "ro_cmd": 'npx -y @openai/codex@latest exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
+        "cmd": 'npx -y @openai/codex@latest ' + CODEX_EFFORT + ' exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
+        "ro_cmd": 'npx -y @openai/codex@latest ' + CODEX_EFFORT + ' exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
         "resume": "",
-        "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"], "default": "gpt-5.6-luna",
+        "models": list(CODEX_MODELS), "default": CODEX_DEFAULT,
     },
     "Codex": {
         "exe": "codex", "speech": "stdout", "pkg": "@openai/codex",
-        "cmd": 'codex exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
+        "cmd": 'codex ' + CODEX_EFFORT + ' exec --skip-git-repo-check --model {model} --dangerously-bypass-approvals-and-sandbox "{ask}"',
         "resume": "",
-        "ro_cmd": 'codex exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
-        "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"], "default": "gpt-5.6-luna",
+        "ro_cmd": 'codex ' + CODEX_EFFORT + ' exec --skip-git-repo-check --model {model} --sandbox read-only "{ask}"',
+        "models": list(CODEX_MODELS), "default": CODEX_DEFAULT,
     },
     "OpenCode": {
         "exe": "opencode", "speech": "stdout", "pkg": "opencode-ai",
@@ -363,6 +369,16 @@ def seat_model(provider: str) -> str:
     else the model that answered the probe. Before any answer the first listed name stands in, and Start's preflight
     checks it before anything is launched."""
     return PROVIDERS[provider].get("default") or default_model(provider) or PROVIDERS[provider]["models"][0]
+
+
+def migrate_seats(seats: list[dict]) -> list[str]:
+    """Seats on a Codex model Agora no longer offers move to the default. Returns one note per seat moved."""
+    notes = []
+    for x in seats:
+        if x.get("provider") in CODEX_PROVIDERS and x.get("model") in OLD_CODEX_MODELS:
+            old = x["model"]; x["model"] = CODEX_DEFAULT
+            notes.append(f"{x.get('name') or x['provider']}: {old} is no longer offered for {x['provider']}, so this seat now uses {CODEX_DEFAULT}.")
+    return notes
 
 
 def provider_gate(provider: str):
@@ -1202,7 +1218,7 @@ def connections() -> dict:
         out[k] = {"models": v["models"], "installed": path is not None, "path": path or "", "exe_default": v["exe"],
                   "override": ov.get(k, ""), "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
                   "state": state, "detail": c.get("detail", ""), "version": VERSIONS.get(k, {}).get("installed", ""),
-                  "model": c.get("model", ""), "checked": c.get("checked", 0), "default_model": default_model(k),
+                  "model": c.get("model", ""), "checked": c.get("checked", 0), "default_model": seat_model(k),
                   "latest": VERSIONS.get(k, {}).get("latest", ""), "warnings": env_warnings(k) + shared_codex_warning(k),
                   "can_install": path is None and k != "Codex (latest)", "npm": not npm_missing(), "node_url": NODE_URL,
                   "install_note": "Runs the newest Codex through npx; there is nothing to install beyond Node.js." if k == "Codex (latest)" else install_argv(k)[1],
@@ -1354,6 +1370,9 @@ class Session:
         self.repo = d.get("repo", DEFAULT_REPO)
         self.room = bool(d.get("room", not d))   # new conversations sit in the room; older saved ones keep their folder
         self.seats = color_seats(d["seats"] if "seats" in d else default_seats())
+        self.pending: list[str] = list(d.get("pending", []))          # Agora notes to put in the chat at the next Start
+        self.bad_models: set[tuple[str, str]] = {tuple(x) for x in d.get("bad_models", [])}   # (CLI, model) refused with 404 here; never probed again
+        moved = migrate_seats(self.seats)
         self.topic = d.get("topic", DEFAULT_TOPIC); self.extra = d.get("extra", "")
         self.rounds = d.get("rounds", 3); self.readonly = bool(d.get("readonly", True)) or self.room   # the room is always read-only
         self.mode = d.get("mode", "turns")   # turns | open
@@ -1370,6 +1389,14 @@ class Session:
         self.skipped = d.get("skipped", [False] * len(self.seats))
         self.cli_sessions = d.get("cli_sessions", {})       # seat index -> CLI session id (Claude resume)
         self.last_seen = d.get("last_seen", {})             # seat index -> transcript length when it last spoke
+        for n in moved:
+            if self.transcript: self.note(n)
+            else: self.pending.append(n)
+
+    def note(self, text: str) -> None:
+        """An Agora note straight into the transcript, for a conversation that is not running."""
+        self.turn += 1
+        self.transcript.append({"turn": self.turn, "speaker": "Agora", "text": text, "kind": "system", "time": dt.datetime.now().strftime("%H:%M:%S"), "color": None})
 
     @property
     def workdir(self) -> str:
@@ -1386,7 +1413,8 @@ class Session:
                 "max_messages": self.max_messages, "max_minutes": self.max_minutes, "started_at": self.started_at, "framing": self.framing, "referee": self.referee,
                 "transcript": self.transcript, "turn": self.turn, "status": self.status,
                 "rounds_done": self.rounds_done, "skipped": self.skipped,
-                "cli_sessions": self.cli_sessions, "last_seen": self.last_seen}
+                "cli_sessions": self.cli_sessions, "last_seen": self.last_seen,
+                "pending": self.pending, "bad_models": sorted(list(x) for x in self.bad_models)}
 
     def save(self, transcript_md: bool = False) -> None:
         (self.dir / "session.json").write_text(json.dumps(self.to_dict()), encoding="utf-8")
@@ -1469,7 +1497,6 @@ class Run:
         self.s = session; self.agora = agora
         self.lock = threading.RLock()
         self.notice = ""                 # why the conversation is paused or stopped, when it did that itself
-        self.paused_for = ""             # the provider whose sign-out paused it, so Resume checks only those seats
         self.preflighting = False
         self.terms: list[dict] = []
         self.current: str | None = None
@@ -1488,21 +1515,23 @@ class Run:
 
 
     def start(self) -> None:
-        """Start, continue, or resume. Before anything is launched every seat is checked with one tiny request through
-        its own CLI, with the model it selected, in the conversation's folder; a seat that fails blocks the start."""
+        """Start, continue, or resume. Before a start every seat is asked one tiny question through its own CLI, with the
+        model it selected, in the conversation's folder. A seat whose model is refused moves to a model of its CLI that
+        answered; a sign-in failure blocks the start. Resume carries on without asking anything."""
         with self.lock:
             s = self.s
             if self.busy() or self.preflighting or len(s.seats) < 2 or not Path(s.workdir).is_dir(): return
-            resume = s.status == "paused" and self.thread is not None and self.thread.is_alive()
-            if resume and not self.notice:
-                self.pause_flag.clear(); s.status = "running"; s.save(); return
-            if not resume: self.stop_flag.clear()
+            if s.status == "paused" and self.thread is not None and self.thread.is_alive():
+                self.notice = ""; self.pause_flag.clear(); s.status = "running"; s.save(); return
+            self.stop_flag.clear()
             one = one_codex(s.seats)
             if one and len(set(codex_seats(s.seats))) > 1:
                 for x in s.seats:
                     if x["provider"] in CODEX_PROVIDERS and x["provider"] != one: x["provider"] = one
                 self._record("Agora", f"Every Codex seat now runs through {one}. One conversation uses one Codex install, "
                                       "because two of them share the same rotating login token.", "system")
+            for n in s.pending: self._record("Agora", n, "system")
+            s.pending = []
             if any(PROVIDERS[x["provider"]]["exe"] in ("codex", "npx") for x in s.seats):
                 note = ensure_codex_trust(s.workdir)
                 if note: self._record("Agora", note, "system")
@@ -1510,21 +1539,19 @@ class Run:
             if not self.terms: self._reset_terms()
             self.preflighting = True; self.agora.start_error = ""
             prev = s.status; s.status = "checking"; s.save()
-        threading.Thread(target=self._check_then_go, args=(resume, prev), daemon=True).start()
+        threading.Thread(target=self._check_then_go, args=(prev,), daemon=True).start()
 
 
-    def _check_then_go(self, resume: bool, prev: str) -> None:
+    def _check_then_go(self, prev: str) -> None:
         try:
-            problems = self.preflight(only=self.paused_for if resume else "")
+            problems = self.preflight()
             with self.lock:
                 s = self.s
                 if problems:
                     s.status = prev; s.save()
                     self.agora.start_error = "Not started. " + " ".join(problems)
                     return
-                if resume:
-                    self.notice = ""; self.paused_for = ""; self.pause_flag.clear(); s.status = "running"; s.save(); return
-                self.notice = ""; self.paused_for = ""
+                self.notice = ""
                 if prev == "done": s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(s.seats))
                 if prev in ("done", "stopped"): s.skipped = [False] * len(s.seats)   # benched seats get another chance on Continue
                 for f in (self.stop_flag, self.pause_flag, self.vote_flag): f.clear()
@@ -1535,18 +1562,20 @@ class Run:
             with self.lock: self.preflighting = False
 
 
-    def preflight(self, only: str = "") -> list[str]:
+    def preflight(self) -> list[str]:
         """One tiny request per distinct (CLI, model) among the seats, built by the same launcher as a real turn, in the
         same folder, with the same environment. Seats on a CLI that must start one at a time take turns; the rest run
-        at once. Returns one line per problem; an empty list means every seat answered."""
+        at once. A seat whose model is refused moves to the first model of its CLI that answered, saved on the seat
+        and noted once in the chat. A model refused with 404 in this conversation is never asked again. Returns one
+        line per problem that blocks the start; an empty list means every seat can speak."""
         s = self.s; pairs: dict[tuple[str, str], list[int]] = {}
-        for i, seat in enumerate(s.seats):
-            if only and seat["provider"] != only: continue
-            pairs.setdefault((seat["provider"], seat["model"]), []).append(i)
+        for i, seat in enumerate(s.seats): pairs.setdefault((seat["provider"], seat["model"]), []).append(i)
         results: dict[tuple[str, str], Turn] = {}
 
         def probe(prov: str, model: str, i: int) -> None:
             if self.stop_flag.is_set(): return
+            if (prov, model) in s.bad_models:
+                self._term(i, f"[{model} was refused with 404 earlier in this conversation; not asked again]"); return
             self._term(i, f"[checking {prov} with {model}]")
             with provider_gate(prov):
                 t = probe_model(prov, model, s.workdir, str(s.seat_dir(i)), s.readonly or s.room,
@@ -1557,21 +1586,46 @@ class Run:
         threads = [threading.Thread(target=probe, args=(p, m, idx[0]), daemon=True) for (p, m), idx in pairs.items()]
         for th in threads: th.start()
         for th in threads: th.join()
-        problems = []
+        problems: list[str] = []; moved: list[str] = []
         for (p, m), idx in pairs.items():
             t = results.get((p, m))
             if t and t.ok: continue
             names = ", ".join(s.label(s.seats[i]) for i in idx)
-            if t is None: problems.append(f"{names} ({p}, {m}): not checked, the conversation was stopped."); continue
-            why = t.error
-            if t.kind == "auth":
-                why += " " + sign_in_hint(p); threading.Thread(target=check_conn, args=(p,), daemon=True).start()
-            elif t.kind == "model":
-                alt = default_model(p)
-                why += " Pick another model for this seat" + (f"; {alt} has answered {p}'s probe." if alt and alt != m else ".")
-            elif t.kind == "launcher": why = f"Agora built a request with no credentials, a launcher bug. The exact command: {t.cmd}"
-            problems.append(f"{names} ({p}, {m}): {why}")
+            refused = (p, m) in s.bad_models
+            if t is None and not refused: problems.append(f"{names} ({p}, {m}): not checked, the conversation was stopped."); continue
+            if t is not None and t.kind != "model":
+                why = t.error
+                if t.kind == "auth":
+                    why += " " + sign_in_hint(p); threading.Thread(target=check_conn, args=(p,), daemon=True).start()
+                elif t.kind == "launcher": why = f"Agora built a request with no credentials, a launcher bug. The exact command: {t.cmd}"
+                problems.append(f"{names} ({p}, {m}): {why}"); continue
+            s.bad_models.add((p, m))
+            said = (t.error if t else "refused with 404 earlier in this conversation")[:160]
+            alt = self._working_model(p)
+            if not alt:
+                problems.append(f"{names} ({p}, {m}): {said} No model of {p} in Agora's list answered, so there is nothing to move the seat to."); continue
+            for i in idx:
+                s.seats[i]["model"] = alt; s.cli_sessions.pop(str(i), None)
+            moved.append(f"{names}: {p} refused {m} ({said}). Now using {alt}, the first model of {p} that answered.")
+        if moved:
+            s.save(); self._record("Agora", "\n".join(moved), "system")
         return problems
+
+
+    def _working_model(self, prov: str) -> str:
+        """The first model of this CLI, in list order, that has answered a probe and has not been refused with 404 in
+        this conversation. When nothing has answered yet, the list is tried now, once, skipping refused models."""
+        s = self.s; ok = MODELS_OK.get(prov, {})
+        pick = next((m for m in PROVIDERS[prov]["models"] if m in ok and (prov, m) not in s.bad_models), "")
+        if pick: return pick
+        with provider_gate(prov):
+            for m in PROVIDERS[prov]["models"]:
+                if (prov, m) in s.bad_models: continue
+                t = probe_model(prov, m, s.workdir)
+                if t.ok: return m
+                if t.kind != "model": break
+                s.bad_models.add((prov, m))
+        return ""
 
 
     def pause(self) -> None:
@@ -1718,12 +1772,13 @@ class Run:
             if t.kind == "auth":
                 if asked == 1 and self._auth_retry(i, seat): continue
                 self._record("Agora", f"{who} was refused as signed out by {prov}: {t.error}. The conversation is paused. "
-                                      f"{sign_in_hint(prov)} Then press Resume; Agora checks the seat before carrying on.", "system")
-                with self.lock: self.notice = f"{prov} signed out, sign in and press Resume"; self.paused_for = prov
+                                      f"{sign_in_hint(prov)} Then press Resume.", "system")
+                with self.lock: self.notice = f"{prov} signed out, sign in and press Resume"
                 self.pause(); threading.Thread(target=check_conn, args=(prov,), daemon=True).start()
                 return None
             if t.kind == "model" and not switched:
-                alt = default_model(prov)
+                s.bad_models.add((prov, seat["model"]))
+                alt = self._working_model(prov)
                 if alt and alt != seat["model"]:
                     old = seat["model"]; switched = True
                     with self.lock: seat["model"] = alt; s.cli_sessions.pop(str(i), None); s.save()
@@ -2050,7 +2105,7 @@ class Agora:
             ut = user_templates()
             if name in ut:   # a saved layout: restore everything
                 d = ut[name]; s = r.s
-                s.seats = color_seats([dict(x) for x in d.get("seats", [])]); s.skipped = [False] * len(s.seats)
+                s.seats = color_seats([dict(x) for x in d.get("seats", [])]); s.skipped = [False] * len(s.seats); s.pending += migrate_seats(s.seats)
                 for k in ("framing", "referee", "mode", "rounds", "readonly", "topic", "extra", "repo", "room", "max_messages", "max_minutes"):
                     if k in d: setattr(s, k, d[k])
                 if s.room: s.readonly = True
@@ -2079,7 +2134,7 @@ class Agora:
                 for x in d["seats"]:
                     if x.get("provider") in PROVIDERS and x.get("model"):
                         seats.append({"name": (x.get("name") or "").strip(), "provider": x["provider"], "model": x["model"].strip(), "stance": (x.get("stance") or "").strip(), "color": (x.get("color") or "").strip()})
-                color_seats(seats)
+                color_seats(seats); s.pending += migrate_seats(seats)
                 if not s.transcript and not self.busy():  # before the first turn anything goes
                     s.seats = seats; s.skipped = [False] * len(seats); r._reset_terms()
                 elif len(seats) == len(s.seats):  # mid-conversation: names fixed, engine swappable

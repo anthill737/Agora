@@ -227,9 +227,19 @@ class Turns(Base):
         self.assertEqual(text, "OK"); self.assertEqual(r.s.seats[0]["model"], "ok")
         self.assertTrue(any("now uses ok" in n and "model404" in n for n in self.notes(r)))
 
-    def test_model_error_with_nothing_probed_sits_out(self) -> None:
+    def test_model_error_with_nothing_probed_tries_the_list_once(self) -> None:
         text, r = self.speak("model404")
-        self.assertIsNone(text); self.assertEqual(r.s.seats[0]["model"], "model404")
+        self.assertEqual(text, "OK"); self.assertEqual(r.s.seats[0]["model"], "ok")
+        self.assertEqual(self.calls("model404"), 1)   # the turn itself; never probed again
+        self.assertIn(("Stub", "model404"), r.s.bad_models)
+
+    def test_model_error_with_no_working_model_sits_out(self) -> None:
+        agora.PROVIDERS["Stub"]["models"] = ["model404"]
+        try:
+            text, r = self.speak("model404")
+        finally:
+            agora.PROVIDERS["Stub"]["models"] = ["model404", "ok"]
+        self.assertIsNone(text); self.assertEqual(r.s.seats[0]["model"], "model404"); self.assertEqual(self.calls("model404"), 1)
         self.assertTrue(any("sits this turn out" in n and "404" in n for n in self.notes(r)))
 
     def test_rate_limit_waits_then_succeeds(self) -> None:
@@ -245,7 +255,7 @@ class Turns(Base):
 
     def test_auth_error_pauses_for_a_sign_in(self) -> None:
         text, r = self.speak("auth401")
-        self.assertIsNone(text); self.assertEqual(r.s.status, "paused"); self.assertIn("signed out", r.notice); self.assertEqual(r.paused_for, "Stub")
+        self.assertIsNone(text); self.assertEqual(r.s.status, "paused"); self.assertIn("signed out", r.notice)
         self.assertEqual(self.calls("auth401"), 2)   # asked once more after the sign-in was re-checked
         self.assertTrue(any("refused as signed out" in n and "401" in n for n in self.notes(r)))
         self.assertEqual(self.speeches(r), [])
@@ -308,14 +318,37 @@ class CodexAuthFile(Base):
 
 
 class Preflight(Base):
-    def test_a_seat_that_fails_blocks_start(self) -> None:
-        r, fake = self.run_for(["ok", "model404"])
-        r.start()
+    def settled(self, r: agora.Run) -> None:
         self.assertTrue(self.wait_for(lambda: not r.preflighting and r.s.status != "checking"))
-        self.assertEqual(r.s.status, "idle"); self.assertIsNone(r.thread)
-        self.assertIn("Not started", fake.start_error); self.assertIn("Seat2 (Stub, model404)", fake.start_error)
-        self.assertIn("Pick another model", fake.start_error); self.assertIn("ok has answered", fake.start_error)
-        self.assertEqual(self.speeches(r), [])
+
+    def test_a_refused_model_moves_the_seat_and_starts(self) -> None:
+        r, fake = self.run_for(["ok", "model404"]); r.start(); self.settled(r)
+        self.assertEqual(fake.start_error, ""); self.assertIn(r.s.status, ("running", "done"))
+        self.assertEqual(r.s.seats[1]["model"], "ok"); self.assertIn(("Stub", "model404"), r.s.bad_models)
+        moves = [n for n in self.notes(r) if "Now using ok" in n]
+        self.assertEqual(len(moves), 1); self.assertIn("Seat2: Stub refused model404", moves[0])
+        self.assertTrue(self.wait_for(lambda: r.s.status == "done", 60))
+        self.assertEqual(self.calls("model404"), 1)   # probed once at Start, never again
+        saved = agora.Session.load(r.s.id); self.assertEqual(saved.seats[1]["model"], "ok"); self.assertIn(("Stub", "model404"), saved.bad_models)
+
+    def test_refused_models_are_never_probed_again(self) -> None:
+        r, fake = self.run_for(["model404", "noaccess"]); r.start(); self.settled(r)
+        self.assertEqual(fake.start_error, "")
+        self.assertEqual([x["model"] for x in r.s.seats], ["ok", "ok"])
+        self.assertTrue(self.wait_for(lambda: r.s.status == "done", 60))
+        self.assertEqual(self.calls("model404"), 1); self.assertEqual(self.calls("noaccess"), 1)
+        self.assertEqual(len([n for n in self.notes(r) if "Now using ok" in n]), 1)   # one note for both seats
+        r2, _ = self.run_for(["model404", "ok"]); r2.s.bad_models = set(r.s.bad_models); r2.start(); self.settled(r2)
+        self.assertEqual(self.calls("model404"), 1)   # known refused: moved without asking
+        self.assertEqual(r2.s.seats[0]["model"], "ok"); self.assertTrue(self.wait_for(lambda: r2.s.status == "done", 60))
+
+    def test_model_failure_with_nothing_answering_blocks(self) -> None:
+        agora.PROVIDERS["Stub"]["models"] = ["model404"]
+        try:
+            r, fake = self.run_for(["model404", "model404"]); r.start(); self.settled(r)
+        finally:
+            agora.PROVIDERS["Stub"]["models"] = ["model404", "ok"]
+        self.assertEqual(r.s.status, "idle"); self.assertIn("nothing to move the seat to", fake.start_error); self.assertEqual(self.calls("model404"), 1)
 
     def test_an_auth_failure_blocks_start_with_the_sign_in_hint(self) -> None:
         r, fake = self.run_for(["ok", "auth401"]); r.start()
@@ -341,6 +374,38 @@ class Preflight(Base):
         sp = self.speeches(r)
         self.assertEqual([e["kind"] for e in sp], ["speech", "speech", "resolution", "resolution"])
         self.assertTrue(all(e["text"] == "OK" for e in sp))
+
+
+class Codex(Base):
+    def test_effort_is_low_on_every_launch(self) -> None:
+        for prov in ("Codex", "Codex (latest)"):
+            for ro in (True, False):
+                cmd = agora.build_cmd(prov, "Say OK.", "gpt-5.6-luna", ro, str(self.tmp))
+                self.assertIn(' -c model_reasoning_effort="low" exec ', cmd, cmd)
+
+    def test_model_list_and_default(self) -> None:
+        want = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.3-codex-spark"]
+        for prov in ("Codex", "Codex (latest)"):
+            self.assertEqual(agora.PROVIDERS[prov]["models"], want); self.assertEqual(agora.seat_model(prov), "gpt-5.6-luna")
+            self.assertEqual(agora.connections()[prov]["default_model"], "gpt-5.6-luna")
+        self.assertEqual(agora.default_seats()[1]["model"], "gpt-5.6-luna")
+        for old in ("gpt-5.5", "gpt-5.6", "gpt-5.4", "gpt-6-astra-pro"):
+            self.assertNotIn(old, want)
+        for x in agora.TEMPLATES["Arena (20 characters + World)"]:
+            if x["provider"] in agora.CODEX_PROVIDERS: self.assertNotIn(x["model"], agora.OLD_CODEX_MODELS)
+
+    def test_saved_seats_on_old_models_migrate_with_a_note(self) -> None:
+        seats = [{"name": "Codex", "provider": "Codex", "model": "gpt-5.5", "stance": ""}, {"name": "Claude", "provider": "Claude Code", "model": "claude-fable-5-1", "stance": ""}]
+        draft = agora.Session(agora.now_id(), {"seats": seats})
+        self.assertEqual(draft.seats[0]["model"], "gpt-5.6-luna"); self.assertEqual(draft.seats[1]["model"], "claude-fable-5-1")
+        self.assertEqual(len(draft.pending), 1); self.assertIn("gpt-5.5 is no longer offered", draft.pending[0]); self.assertEqual(draft.transcript, [])
+        started = agora.Session(agora.now_id(), {"seats": [dict(x, model="gpt-5.6") for x in seats[:1]] + seats[1:], "transcript": [{"turn": 1, "speaker": "Claude", "text": "hi", "kind": "speech", "time": "00:00:00", "color": None}], "turn": 1})
+        self.assertEqual(started.seats[0]["model"], "gpt-5.6-luna"); self.assertEqual(started.seats[0]["provider"], "Codex")
+        self.assertEqual(started.transcript[-1]["kind"], "system"); self.assertIn("now uses gpt-5.6-luna", started.transcript[-1]["text"])
+        self.assertEqual(started.pending, [])
+        r, _ = self.run_for(["ok", "ok"]); r.s.pending = ["moved note"]; r.start()
+        self.assertTrue(self.wait_for(lambda: r.s.status == "done", 60))
+        self.assertIn("moved note", self.notes(r)); self.assertEqual(r.s.pending, [])
 
 
 class Connections(Base):
