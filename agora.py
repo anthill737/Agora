@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import json
 import os
@@ -41,8 +42,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # the folder offered when a conversation chooses "A folder I choose"
-BUILD = "2026-09-06.12"
-TURN_TIMEOUT = 1800
+BUILD = "2026-09-07.1"
+TURN_TIMEOUT = 1800      # wall clock: a turn is killed after this many seconds, whatever it is still printing
+IDLE_TIMEOUT = 300       # a turn that prints nothing at all for this long is killed
+PROBE_TIMEOUT = 240      # one tiny request, as a probe or a priming prompt, gets this long in total
+RATE_BACKOFF = (20.0, 60.0, 180.0)   # waits before asking again after a 429 or a 5xx; after the last one the seat sits the turn out
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
 ROOM = HERE.with_name("agora_room")   # the empty room agents sit in when a conversation points at no folder
@@ -180,7 +184,47 @@ def env_warnings(provider: str) -> list[list[str]]:
 
 
 _GATES: dict[str, threading.Lock] = {k: threading.Lock() for k in PROVIDERS}   # one start at a time per gated provider
-_AUTH_RE = re.compile(r"oauth|not logged in|/login\b|log in|authenticat|unauthori[sz]ed|\b401\b|token.{0,30}(expired|refresh|revoked)|please run .?claude.?\s*(auth|login)", re.I)
+
+# Why a turn failed, read from the runner's own message once its exit code or error flag has said that it failed.
+# The order matters: a request that went out with no credentials at all is Agora's bug, not the user's sign-in.
+_LAUNCH_RE = re.compile(r"missing (bearer|credentials?|authorization( header)?|auth header)|no credentials? (were |was )?(found|provided|supplied|sent|given)"
+                        r"|credentials? (are |is |were )?missing|could not resolve (an )?authentication|no authentication method|without (any )?credentials"
+                        r"|authorization header (is )?(missing|absent|required)", re.I)
+_AUTH_RE = re.compile(r"(?<![\d.])401(?![\d.])|unauthori[sz]ed|not (logged|signed) in|token.{0,30}(expired|refresh|revoked|invalid)|revoked|/login\b"
+                      r"|please run .{0,24}(auth|login)|authentication.{0,20}(failed|required|error)|could not authenticate|invalid.{0,10}(session|refresh token)"
+                      r"|log in again|sign in again", re.I)
+_MODEL_RE = re.compile(r"(?<![\d.])404(?![\d.])|model[^\n]{0,80}(not found|does not exist|doesn't exist|unknown|not supported|unsupported|not available"
+                       r"|unavailable|no access|not permitted|not allowed|invalid|not enabled)|(unknown|invalid|unsupported|unrecognized|unavailable) model"
+                       r"|no access to (the |this )?model|model_not_found|not_found_error|(do|does) not have access|don't have access|not entitled|verification required|requires a newer version|upgrade to the latest (app|cli|version)", re.I)
+_RATE_RE = re.compile(r"(?<![\d.])(429|5\d\d)(?![\d.])|rate.?limit|too many requests|overloaded|server error|service unavailable|bad gateway"
+                      r"|gateway time.?out|temporarily unavailable|usage limit|quota|capacity|try again later|internal error", re.I)
+
+
+def classify(text: str) -> str:
+    """launcher: the request carried no credentials, which is Agora's bug and stops the run.
+    auth: the sign-in was refused or has expired; the conversation pauses until the user signs in.
+    model: the selected model does not exist for this account; the seat moves to a model that answered a probe.
+    rate: 429 or 5xx; wait and ask again. other: anything else; ask once more, then sit the turn out."""
+    t = strip_ansi(text or "")
+    if _LAUNCH_RE.search(t): return "launcher"
+    if _AUTH_RE.search(t): return "auth"
+    if _MODEL_RE.search(t): return "model"
+    if _RATE_RE.search(t): return "rate"
+    return "other"
+
+
+def sign_in_hint(provider: str) -> str:
+    """What to do when a CLI says it is signed out, in that CLI's own terms."""
+    if provider == "Claude Code":
+        h = ("Run 'claude' in a terminal and /login if it asks, or press Sign in under Settings, Connections. If other Claude sessions are open, "
+             "one of them may have rotated the login token; Agora starts Claude seats one at a time so its own seats do not do that to each other.")
+        if sys.platform == "darwin" and os.environ.get("SSH_CONNECTION"): h += " Agora is running over SSH, where the macOS Keychain that holds the login is locked."
+        return h
+    if provider == "Copilot CLI": return "Run 'copilot login' in a terminal, or press Sign in under Settings, Connections."
+    if provider in ("Codex", "Codex (latest)"): return "Run 'codex login' in a terminal, or press Sign in under Settings, Connections."
+    if provider == "OpenCode": return "Run 'opencode auth login' in a terminal."
+    if provider == "Gemini CLI": return "Run 'gemini' in a terminal and finish the sign-in."
+    return ""
 
 
 def decode_out(b: bytes) -> str:
@@ -192,24 +236,6 @@ def decode_out(b: bytes) -> str:
         except Exception: return b.decode("utf-8", errors="replace")
 
 
-def looks_like_auth_error(text: str) -> bool:
-    return bool(_AUTH_RE.search(text or ""))
-
-
-def auth_hint(provider: str, text: str) -> str:
-    if not looks_like_auth_error(text): return ""
-    if provider == "Claude Code":
-        h = ("Claude Code could not use its login. Run 'claude' in a terminal and /login if it asks. If other Claude sessions are open, "
-             "one of them may have rotated the login token; Agora starts Claude seats one at a time so its own seats do not do that to each other.")
-        if sys.platform == "darwin" and os.environ.get("SSH_CONNECTION"): h += " Agora is running over SSH, where the macOS Keychain that holds the login is locked."
-        return h
-    if provider == "Copilot CLI": return "Copilot CLI is not logged in for this user. Run 'copilot login' in a terminal."
-    if provider in ("Codex", "Codex (latest)"): return "Codex is not logged in. Run 'codex login' in a terminal."
-    if provider == "OpenCode": return "OpenCode has no credentials for that model. Run 'opencode auth login'."
-    if provider == "Gemini CLI": return "Gemini CLI is not logged in. Run 'gemini' in a terminal and finish the sign-in."
-    return ""
-
-
 def build_cmd(provider: str, ask: str, model: str, readonly: bool, seat_dir: str = "") -> str:
     """The shell command for one turn, using the saved executable path when there is one."""
     prov = PROVIDERS[provider]
@@ -219,41 +245,156 @@ def build_cmd(provider: str, ask: str, model: str, readonly: bool, seat_dir: str
     return cmd
 
 
-TESTS: dict[str, dict] = {}   # provider -> result of the last "Test" from Settings
-
-
-def cli_test(provider: str, folder: str) -> None:
-    """Ask the CLI one trivial question the way a seat would, read-only, and keep the verdict. Costs one tiny request."""
-    prov = PROVIDERS.get(provider)
-    if not prov: return
-    if not cli_path(provider):
-        TESTS[provider] = {"ok": False, "text": "not found", "secs": 0, "when": dt.datetime.now().strftime("%H:%M")}; return
-    model = ARENA_MODEL.get(provider) or prov["models"][0]
-    cwd = folder if Path(folder).is_dir() else str(Path.home())
-    cmd = build_cmd(provider, "Reply with the single word OK and nothing else.", model, readonly=True, seat_dir=cwd)
-    t0 = time.time(); gate = _GATES[provider] if prov.get("gate") else None
-    got = bool(gate and gate.acquire(timeout=120))
+def kill_tree(p: subprocess.Popen) -> None:
+    """Kill a CLI and everything it started. With shell=True the process Agora holds is the shell; the CLI is its child."""
     try:
-        r = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, timeout=180, stdin=subprocess.DEVNULL, env=child_env(provider))
-        out, err = decode_out(r.stdout or b""), decode_out(r.stderr or b""); final = ""
-        if prov["speech"] == "claude_stream":
-            for ln in out.splitlines():
-                try: ev = json.loads(ln)
-                except Exception: continue
-                if ev.get("type") == "result": final = "" if ev.get("is_error") else (ev.get("result") or "")
-                if ev.get("type") == "result" and ev.get("is_error"): err = (ev.get("result") or "") + "\n" + err
-        else: final = out.strip()
-        ok = r.returncode == 0 and bool(final.strip())
-        tail = "\n".join([ln for ln in (err.strip().splitlines() or out.strip().splitlines()) if ln.strip()][-6:])
-        text = f"answered: {final.strip()[:80]}" if ok else (tail or f"exit code {r.returncode}, no output")
-        hint = "" if ok else auth_hint(provider, out + "\n" + err)
-    except subprocess.TimeoutExpired:
-        ok, text, hint = False, "timed out after 180 s", ""
+        if os.name == "nt": subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=15)
+        else: os.killpg(os.getpgid(p.pid), 9)
+    except Exception:
+        try: p.kill()
+        except Exception: pass
+
+
+class Turn:
+    """What one run of a CLI produced. The exit code and the runner's own error flag decide whether it worked; only
+    then is the output read as speech. When it failed, speech is None, error holds the runner's own message, and
+    kind names the class of failure: launcher, auth, model, rate, timeout, or other."""
+
+    def __init__(self, cmd: str) -> None:
+        self.cmd = cmd; self.rc: int | None = None; self.speech: str | None = None; self.error = ""; self.kind = ""
+        self.stdout: list[str] = []; self.err_tail: list[str] = []; self.timed_out = ""; self.session_id: str | None = None; self.secs = 0.0
+
+    @property
+    def ok(self) -> bool: return self.speech is not None
+
+
+def run_turn(provider: str, cmd: str, cwd: str, on_line=None, on_start=None, wall: float = 0, idle: float = 0,
+             procs: dict | None = None, key=None) -> Turn:
+    """The one launcher. Every turn, probe, and priming prompt goes through here with the same environment and is read
+    the same way. Two clocks run: the process is killed after `wall` seconds whatever it is printing, and after `idle`
+    seconds without printing anything. A run has failed when the runner's error flag is set, when the exit code is
+    not 0, when it was killed, or when it printed nothing; its output is then never read as speech."""
+    prov = PROVIDERS[provider]; t = Turn(cmd); wall = wall or TURN_TIMEOUT; idle = idle or IDLE_TIMEOUT
+    say = on_line or (lambda ln: None); t0 = time.time(); last = [t0]; started = [False]; flagged: list[str] = []; final: list[str] = []
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=(os.name != "nt"), env=child_env(provider))
     except Exception as exc:  # noqa: BLE001
-        ok, text, hint = False, f"{type(exc).__name__}: {exc}", ""
-    finally:
-        if got: gate.release()   # type: ignore[union-attr]
-    TESTS[provider] = {"ok": ok, "text": text, "hint": hint, "secs": round(time.time() - t0, 1), "when": dt.datetime.now().strftime("%H:%M")}
+        t.error = f"could not start: {type(exc).__name__}: {exc}"; t.kind = "launcher"; return t
+    if procs is not None and key is not None: procs[key] = proc
+
+    def pump_out() -> None:
+        try:
+            for raw in proc.stdout:  # type: ignore[union-attr]
+                ln = decode_out(raw).rstrip("\r\n"); last[0] = time.time(); t.stdout.append(ln)
+                if ln.strip() and not started[0]:
+                    started[0] = True
+                    if on_start: on_start()
+                if prov["speech"] == "claude_stream":
+                    try: ev = json.loads(ln)
+                    except Exception: ev = {}
+                    if isinstance(ev, dict):
+                        if ev.get("session_id"): t.session_id = ev["session_id"]
+                        if ev.get("type") == "result":
+                            if ev.get("is_error"): flagged.append(str(ev.get("result") or ev.get("error") or "the runner flagged an error"))
+                            else: final.append(ev.get("result") or "")
+                    shown, _ = render_claude_event(ln)
+                    if shown: say(shown)
+                else: say(ln)
+        except Exception: pass
+
+    def pump_err() -> None:
+        try:
+            for raw in proc.stderr:  # type: ignore[union-attr]
+                ln = decode_out(raw).rstrip("\r\n"); last[0] = time.time(); t.err_tail.append(ln); del t.err_tail[:-12]; say(ln)
+        except Exception: pass
+
+    pumps = [threading.Thread(target=pump_out, daemon=True), threading.Thread(target=pump_err, daemon=True)]
+    for th in pumps: th.start()
+    while proc.poll() is None:
+        now = time.time()
+        if now - t0 > wall: t.timed_out = "wall"; break
+        if now - last[0] > idle: t.timed_out = "idle"; break
+        time.sleep(0.25)
+    if t.timed_out:
+        kill_tree(proc)
+        try: proc.wait(timeout=20)
+        except Exception: pass
+    for th in pumps: th.join(timeout=10)
+    for f in (proc.stdout, proc.stderr):
+        try: f.close()  # type: ignore[union-attr]
+        except Exception: pass
+    t.rc = proc.returncode; t.secs = round(time.time() - t0, 1)
+    tail = [ln for ln in (t.err_tail or t.stdout[-12:]) if ln.strip()]
+    marked = [ln for ln in tail if re.match(r"\s*(error|fatal|panic)\b", ln, re.I)]
+    if marked: tail = marked[-3:]   # the CLI's own error lines, without the banner it printed before them
+    if t.timed_out:
+        t.error = f"killed after {int(wall)} s, the most a turn may take" if t.timed_out == "wall" else f"killed after {int(idle)} s without printing anything"
+        t.kind = "timeout"
+    elif flagged: t.error = " ".join(strip_ansi(flagged[-1]).split())[:400]
+    elif t.rc != 0: t.error = (" ".join(strip_ansi(" ".join(tail[-6:])).split())[:400] or "no output") + f" (exit code {t.rc})"
+    else:
+        speech = (final[-1] if final else "") if prov["speech"] == "claude_stream" else "\n".join(t.stdout).strip()
+        if speech.strip(): t.speech = speech
+        elif prov["speech"] == "claude_stream" and not final: t.error = "exit code 0 but no final answer" + (": " + " ".join(tail[-3:]) if tail else "")
+        else: t.error = "exit code 0 but printed nothing"
+    if not t.ok and not t.kind: t.kind = classify(t.error + "\n" + "\n".join(tail))
+    return t
+
+
+# ---------------------------------------------------------------- probes and the default model
+PROBE_ASK = "Reply with the single word OK and nothing else."
+MODELS_OK: dict[str, dict[str, dict]] = {}   # provider -> model -> {"when": unix time, "secs": how long that answer took}
+
+
+def note_model_ok(provider: str, model: str, secs: float = 0.0) -> None:
+    MODELS_OK.setdefault(provider, {})[model] = {"when": time.time(), "secs": secs}
+
+
+def default_model(provider: str) -> str:
+    """The first model in the provider's list that has actually answered a probe, in list order, else any other model
+    that answered. Empty until something has answered: nothing is assumed."""
+    ok = MODELS_OK.get(provider, {})
+    return next((m for m in PROVIDERS[provider]["models"] if m in ok), next(iter(ok), ""))
+
+
+def seat_model(provider: str) -> str:
+    """What a new seat is given: the model that answered the probe. Before any answer the first listed name stands
+    in, and Start's preflight checks it before anything is launched."""
+    return default_model(provider) or PROVIDERS[provider]["models"][0]
+
+
+def provider_gate(provider: str):
+    """Claude Code starts one process at a time (its login token rotates on refresh, and parallel starts log each other
+    out). The two Codex installs share one token, so their probes and priming prompts take turns too."""
+    if PROVIDERS[provider].get("gate"): return _GATES[provider]
+    if provider in CODEX_PROVIDERS: return _prime_lock
+    return contextlib.nullcontext()
+
+
+def probe_model(provider: str, model: str, workdir: str, seat_dir: str = "", readonly: bool = True, on_line=None, procs=None, key=None) -> Turn:
+    """One tiny request to this provider with exactly this model, built by the same launcher as a real turn."""
+    cmd = build_cmd(provider, PROBE_ASK, model, readonly, seat_dir or workdir)
+    t = run_turn(provider, cmd, workdir, on_line=on_line, wall=PROBE_TIMEOUT, idle=min(PROBE_TIMEOUT, IDLE_TIMEOUT), procs=procs, key=key)
+    if t.ok:
+        note_model_ok(provider, model, t.secs)
+        if provider in CODEX_PROVIDERS: _LAST_PRIME[provider] = time.time()
+    return t
+
+
+def probe_provider(provider: str) -> tuple[Turn, str, list[str]]:
+    """Find the first listed model this account can use: try them in order until one answers. Stops at the first
+    failure that is not about the model, since a sign-in problem is the same for every model. Returns the last
+    run, its model, and one line per model that was refused."""
+    last: Turn | None = None; model = ""; tried: list[str] = []
+    if provider in CODEX_PROVIDERS: ensure_codex_trust(room_dir())
+    with provider_gate(provider):
+        for model in PROVIDERS[provider]["models"]:
+            last = probe_model(provider, model, room_dir())
+            if last.ok: break
+            tried.append(f"{model}: {last.error[:200]}")
+            if last.kind != "model": break
+    return last, model, tried  # type: ignore[return-value]
 
 
 DEFAULT_TOPIC = ("What is the most important thing about how you work that the other agents in this room do not know? Say only what you can observe about yourself right now or cite from public documentation, label each claim, and disagree openly.")
@@ -402,9 +543,13 @@ def render_claude_event(line: str) -> tuple[str | None, str | None]:
 
 # ---------------------------------------------------------------- templates
 CL, CX = "Claude Code", "Codex (latest)"
-CLM, CXM = "claude-fable-5-1", "gpt-6-astra"
-DEFAULT_SEATS = [{"name": "Claude", "provider": CL, "model": CLM, "stance": ""}, {"name": "Codex", "provider": CX, "model": CXM, "stance": ""}]
-ARENA_MODEL = {CL: "claude-haiku-4-5", CX: "gpt-5.5", "Codex": "gpt-5.5", "Copilot CLI": "auto"}   # a game is many short turns, so cheap models by default
+
+
+def default_seats() -> list[dict]:
+    """A new conversation's two seats. Models come from the probes, never from a constant."""
+    return [{"name": "Claude", "provider": CL, "model": seat_model(CL), "stance": ""}, {"name": "Codex", "provider": CX, "model": seat_model(CX), "stance": ""}]
+
+
 ARENA_TOPIC = ("A walled arena with a market stall, a training yard, and a healer's tent. Twenty strangers, "
                "one season. Gold buys goods and favors, training raises skills, fights cost health, and the dead "
                "stay dead. Every six rounds the World holds a vote: the character the others trust least is exiled. "
@@ -416,7 +561,7 @@ PALETTE = ["#22D3EE", "#F59E0B", "#A78BFA", "#34D399", "#F472B6", "#60A5FA", "#F
 
 
 def _seat(name: str, prov: str, stance: str = "") -> dict:
-    return {"name": name, "provider": prov, "model": CLM if prov == CL else CXM, "stance": stance}
+    return {"name": name, "provider": prov, "model": seat_model(prov), "stance": stance}
 
 
 def color_seats(seats: list[dict]) -> list[dict]:
@@ -460,7 +605,7 @@ def _first_cli() -> str:
 
 def _added_seat(prov: str, name: str = "", stance: str = "") -> dict:
     if not cli_path(prov): prov = _first_cli()
-    return {"name": name, "provider": prov, "model": ARENA_MODEL.get(prov) or PROVIDERS[prov]["models"][0], "stance": stance}
+    return {"name": name, "provider": prov, "model": seat_model(prov), "stance": stance}
 
 
 def game_shape(s: "Session") -> None:
@@ -499,7 +644,7 @@ def council_shape(s: "Session") -> None:
         if by_name.get((x.get("name") or "").lower()) == x.get("stance"): continue
         seats.append({**x, "stance": "" if x.get("stance") in stances else x.get("stance", "")})
     names = {(x.get("name") or "").lower() for x in seats}
-    for d in DEFAULT_SEATS:
+    for d in default_seats():
         if len(seats) >= 2: break
         if d["name"].lower() not in names: seats.append(dict(d))
     s.seats = color_seats(seats); s.skipped = [False] * len(seats); s.referee = ""
@@ -543,7 +688,7 @@ TEMPLATES: dict[str, list[dict]] = {
         _seat("Economist", CL, "Cost in tokens, time, and complexity."),
         _seat("Judge", CX, "Neutral. Summarize agreement and disagreement, force decisions."),
     ],
-    # a game, not a council: 20 characters plus the World as referee, on cheap models
+    # a game, not a council: 20 characters plus the World as referee
     "Arena (20 characters + World)": [_seat("World", CL, WORLD_STANCE)] + [
         _seat(n, CL if i % 2 == 0 else CX, st) for i, (n, st) in enumerate(ARENA_CHARACTERS)],
     # names only, no stances
@@ -598,12 +743,12 @@ VERSIONS: dict[str, dict] = {}     # provider -> {"installed": str, "latest": st
 _ver_lock = threading.Lock()
 
 
-def _ver_of(cmd: list[str]) -> tuple[bool, str]:
+def _ver_of(cmd: list[str], timeout: int = 25) -> tuple[bool, str]:
     """Run a command and return (exit ok, the version it printed). Some CLIs add a line about updates after the
     version, so take the first line that actually looks like a version rather than the last line."""
     try:
         cmd = [shutil.which(cmd[0], path=agent_path()) or cmd[0]] + cmd[1:]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL, env=child_env(""))
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, env=child_env(""))
         lines = [ln.strip() for ln in (r.stdout or r.stderr or "").strip().splitlines() if ln.strip()]
         best = next((ln for ln in lines if re.search(r"\d+\.\d+", ln)), lines[-1] if lines else "")
         return r.returncode == 0, best
@@ -708,7 +853,7 @@ def probe_claude(exe: str) -> tuple[str, str]:
 
 def probe_codex_files() -> tuple[str, str]:
     """Codex keeps its login in ~/.codex/auth.json. Read for the npx seat, which has no binary to ask."""
-    f = Path.home() / ".codex" / "auth.json"
+    f = CODEX_AUTH
     if not f.exists(): return "off", "Not signed in."
     try: d = json.loads(f.read_text(encoding="utf-8"))
     except Exception: return "unknown", f"{f} cannot be read."
@@ -748,12 +893,29 @@ def probe_gemini(exe: str) -> tuple[str, str]:
 
 
 def probe_copilot(exe: str) -> tuple[str, str]:
-    """Copilot CLI has no sign-in status command and keeps its login in the operating system credential store,
-    which Agora cannot read, so only a real request can tell."""
-    t = TESTS.get("Copilot CLI")
-    if t and t.get("ok"): return "on", f"Answered a test prompt at {t.get('when', '')}."
-    if t and not t.get("ok"): return "off", (t.get("hint") or t.get("text") or "The check failed.")
-    return "ask", "No sign-in status command exists for this CLI, so Agora cannot tell without asking it something. Press Check: one tiny request."
+    """Copilot CLI has no sign-in status command and keeps its login in the operating system credential store, which
+    Agora cannot read. Only the real probe, one tiny request, can tell."""
+    return "unknown", ""
+
+
+def status_probe(name: str, path: str) -> tuple[str, str]:
+    """What the CLI's own status command says: off when it is signed out, otherwise a note. Costs no request."""
+    if name == "Claude Code": return probe_claude(path)
+    if name == "Codex": return probe_codex(path)
+    if name == "Codex (latest)":
+        cx = cli_path("Codex")
+        state, detail = probe_codex(cx) if cx else probe_codex_files()
+        return state, detail.rstrip(".") + ". This seat runs the newest Codex through npx and uses the same login."
+    if name == "OpenCode": return probe_opencode(path)
+    if name == "Gemini CLI": return probe_gemini(path)
+    return probe_copilot(path)
+
+
+def real_version(name: str, path: str) -> str:
+    """The version the binary itself prints. The npx seat asks npx, which is slow the first time but exact."""
+    prov = PROVIDERS[name]
+    ok, ver = _ver_of(["npx", "-y", prov["pkg"] + "@latest", "--version"], 90) if prov.get("isolated") else _ver_of([path, "--version"])
+    return ver if ok else ""
 
 
 CONN: dict[str, dict] = {}          # provider -> {state, detail, version, checked, checking}
@@ -765,33 +927,34 @@ def _set_conn(name: str, **kw) -> None:
     with _conn_lock: CONN.setdefault(name, {}).update(kw)
 
 
-def check_conn(name: str, paid: bool = False) -> dict:
-    """One provider's state, from its own CLI. paid lets the Copilot check spend one tiny request."""
+def check_conn(name: str) -> dict:
+    """One provider's state. Its own status command says whether it is signed out; only one tiny request through the
+    same launcher a turn uses, with the first listed model that answers, says that it is connected."""
     prov = PROVIDERS.get(name)
     if not prov: return {}
     _set_conn(name, checking=True)
     try:
         path = cli_path(name)
         if not path:
-            _set_conn(name, state="none", detail="Not installed.", version="", checked=time.time()); return CONN[name]
-        ver = ""
-        if not prov.get("isolated"):
-            ok, ver = _ver_of([path, "--version"])
-            if not ok: ver = ""
+            _set_conn(name, state="none", detail="Not installed.", version="", model="", checked=time.time()); return CONN[name]
+        ver = real_version(name, path)
         with _ver_lock: VERSIONS.setdefault(name, {})["installed"] = ver
-        if name == "Claude Code": state, detail = probe_claude(path)
-        elif name == "Codex": state, detail = probe_codex(path)
-        elif name == "Codex (latest)":
-            cx = cli_path("Codex")
-            state, detail = probe_codex(cx) if cx else probe_codex_files()
-            detail = detail.rstrip(".") + ". This seat runs the newest Codex through npx and uses the same login."
-        elif name == "Copilot CLI":
-            if paid: cli_test(name, room_dir())
-            state, detail = probe_copilot(path)
-        elif name == "OpenCode": state, detail = probe_opencode(path)
-        elif name == "Gemini CLI": state, detail = probe_gemini(path)
-        else: state, detail = "unknown", ""
-        _set_conn(name, state=state, detail=detail, version=ver, checked=time.time())
+        state, detail = status_probe(name, path)
+        if state == "off":
+            _set_conn(name, state="off", detail=detail, version=ver, model="", checked=time.time()); return CONN[name]
+        t, model, tried = probe_provider(name)
+        when = dt.datetime.now().strftime("%H:%M")
+        if t.ok:
+            _set_conn(name, state="on", version=ver, model=model, checked=time.time(),
+                      detail=f"{model} answered a one-word request at {when} in {t.secs} s." + (f" {detail}" if detail else ""))
+        elif t.kind == "auth":
+            _set_conn(name, state="off", version=ver, model="", checked=time.time(), detail=f"Refused at {when}: {t.error} {sign_in_hint(name)}")
+        elif t.kind == "model":
+            hint = " Update Codex, or use the Codex (latest) seat." if name == "Codex" and "newer version" in " ".join(tried) else ""
+            _set_conn(name, state="fail", version=ver, model="", checked=time.time(), detail=f"No listed model answered at {when}. " + " ".join(tried) + hint)
+        else:
+            why = {"rate": "Busy or rate limited", "timeout": "No answer", "launcher": "Agora built a request with no credentials, a launcher bug"}.get(t.kind, "The request failed")
+            _set_conn(name, state="fail", version=ver, model="", checked=time.time(), detail=f"{why} at {when}: {t.error}")
         return CONN[name]
     finally:
         _set_conn(name, checking=False)
@@ -811,19 +974,27 @@ def conn_state(name: str) -> str:
 
 
 # ---------------------------------------------------------------- Codex tokens
-# Codex refresh tokens rotate: the moment one process refreshes, the token every other process holds is dead. Several
-# Codex seats starting at once therefore race, all but one lose with a 401, and a losing writer can leave
-# ~/.codex/auth.json half written. Agora avoids the race instead of retrying through it: one priming prompt runs
-# through Codex alone first, so exactly one process does the refresh, and the file it leaves behind is copied aside.
-# If a seat is refused anyway, the conversation pauses, the copy goes back, the priming prompt runs again, and the
-# conversation resumes by itself. Seats still run fully in parallel; only the priming is on its own.
+# Codex refresh tokens rotate: the moment one process refreshes, the token every other process holds is dead, so
+# several Codex seats starting at once race and all but one lose with a 401. Agora avoids the race instead of
+# retrying through it: one priming prompt runs through Codex alone before Codex seats start, so exactly one process
+# does the refresh. Agora reads ~/.codex/auth.json only to tell whether the npx seat is signed in. It never writes,
+# copies, or restores it: when Codex says it is signed out, the conversation pauses and asks for Codex's own sign-in.
 CODEX_PROVIDERS = ("Codex", "Codex (latest)")
 CODEX_AUTH = Path.home() / ".codex" / "auth.json"
-CODEX_BACKUP = HERE.with_name("agora_codex_auth.bak")
 CODEX_PRIME_TTL = 1500.0     # re-prime if the last one is older than this, so a stale access token is refreshed alone
 CODEX_SIGNIN_NOTE = "Not signed in with a ChatGPT account. Press Sign in and choose your ChatGPT account."
 _prime_lock = threading.Lock()
 _LAST_PRIME: dict[str, float] = {}
+
+
+def forget_codex_backups() -> list[str]:
+    """Earlier builds copied ~/.codex/auth.json aside as agora_codex_auth.bak. No copy is kept any more, and any left
+    behind is deleted. Returns what was deleted."""
+    gone = []
+    for f in HERE.parent.glob("agora_codex_auth.bak*"):
+        try: f.unlink(); gone.append(str(f))
+        except Exception: pass
+    return gone
 
 
 def codex_seats(seats: list[dict]) -> list[str]:
@@ -839,50 +1010,16 @@ def one_codex(seats: list[dict]) -> str:
     return "Codex" if cli_path("Codex") else "Codex (latest)"
 
 
-def backup_codex_auth() -> bool:
-    try:
-        if CODEX_AUTH.exists() and CODEX_AUTH.stat().st_size > 0:
-            CODEX_BACKUP.write_bytes(CODEX_AUTH.read_bytes()); return True
-    except Exception: pass
-    return False
-
-
-def restore_codex_auth() -> bool:
-    try:
-        if CODEX_BACKUP.exists() and CODEX_BACKUP.stat().st_size > 0:
-            CODEX_AUTH.parent.mkdir(parents=True, exist_ok=True)
-            CODEX_AUTH.write_bytes(CODEX_BACKUP.read_bytes()); return True
-    except Exception: pass
-    return False
-
-
-def codex_prime(provider: str, workdir: str, force: bool = False) -> tuple[bool, str]:
-    """One short prompt through Codex, alone, so a single process performs any token refresh. On success the fresh
-    credentials are copied aside. Returns (worked, what it said)."""
-    if provider not in CODEX_PROVIDERS: return True, ""
+def codex_prime(provider: str, model: str, workdir: str, force: bool = False) -> Turn | None:
+    """One short prompt through Codex, alone, with the model a seat actually selected, so a single process performs
+    any token refresh. None when a recent priming makes it unnecessary."""
+    if provider not in CODEX_PROVIDERS: return None
     with _prime_lock:
-        if not force and time.time() - _LAST_PRIME.get(provider, 0) < CODEX_PRIME_TTL: return True, "primed recently"
-        model = ARENA_MODEL.get(provider) or PROVIDERS[provider]["models"][-1]
+        if not force and time.time() - _LAST_PRIME.get(provider, 0) < CODEX_PRIME_TTL: return None
         cmd = build_cmd(provider, "Reply with the single word READY and nothing else.", model, readonly=True, seat_dir=workdir)
-        try:
-            r = subprocess.run(cmd, cwd=workdir, shell=True, capture_output=True, timeout=300,
-                               stdin=subprocess.DEVNULL, env=child_env(provider))
-            out = decode_out((r.stdout or b"") + b"\n" + (r.stderr or b""))
-        except subprocess.TimeoutExpired:
-            return False, "Codex did not answer the priming prompt within five minutes."
-        except Exception as exc:  # noqa: BLE001
-            return False, f"{type(exc).__name__}: {exc}"
-        if r.returncode == 0 and not looks_like_auth_error(out):
-            _LAST_PRIME[provider] = time.time(); backup_codex_auth()
-            return True, " ".join(out.split())[:120]
-        return False, " ".join(strip_ansi(out).split())[:200] or f"exit code {r.returncode}"
-
-
-def codex_signed_out(text: str) -> bool:
-    """The refused-because-signed-out answer, as Codex words it."""
-    t = (text or "").lower()
-    return ("401" in t or "unauthorized" in t or "not logged in" in t or "please run codex login" in t
-            or "refresh token" in t or ("token" in t and "expired" in t))
+        t = run_turn(provider, cmd, workdir, wall=PROBE_TIMEOUT, idle=min(PROBE_TIMEOUT, IDLE_TIMEOUT))
+        if t.ok: _LAST_PRIME[provider] = time.time(); note_model_ok(provider, model, t.secs)
+        return t
 
 
 # ---------------------------------------------------------------- sign in, in a real terminal
@@ -896,7 +1033,7 @@ def login_argv(name: str) -> list[str]:
         "Copilot CLI": ["copilot", "login", "--device-code"],
         "OpenCode": ["opencode", "auth", "login"],
         "Gemini CLI": ["gemini"],
-    }[name]
+    }.get(name, [PROVIDERS[name]["exe"], "login"])
 
 
 WATCH: dict[str, dict] = {}   # provider -> {"until": t, "since": t} while Agora waits for a sign-in to finish
@@ -911,8 +1048,11 @@ def watch_login(provider: str) -> None:
     WATCH[provider] = {"since": time.time(), "until": time.time() + WATCH_FOR}
     def work() -> None:
         while time.time() < WATCH[provider]["until"]:
-            time.sleep(WATCH_EVERY)
+            time.sleep(WATCH_EVERY if provider != "Copilot CLI" else WATCH_EVERY * 4)   # Copilot has no status command, so each look costs one request
             if provider not in WATCH: return
+            path = cli_path(provider)
+            if not path and provider != "Codex (latest)": continue
+            if status_probe(provider, path or "")[0] == "off": continue   # still signed out: costs nothing to ask
             check_conn(provider)
             if conn_state(provider) == "on": break
         WATCH.pop(provider, None)
@@ -1041,6 +1181,14 @@ def start_install(provider: str) -> dict:
     return {"ok": True}
 
 
+def shared_codex_warning(name: str) -> list[list[str]]:
+    """Both Codex installs read the same ~/.codex/auth.json, whose token rotates on refresh."""
+    if name not in CODEX_PROVIDERS or not cli_path("Codex") or not cli_path("Codex (latest)"): return []
+    other = "Codex (latest)" if name == "Codex" else "Codex"
+    return [["warn", f"{name} and {other} share one ChatGPT sign-in, and its token rotates on refresh: whichever refreshes last signs the other "
+                     "out. Use one of them in a conversation; Agora moves mixed seats onto one at Start."]]
+
+
 def connections() -> dict:
     """Everything the Connections screen shows. No secret ever leaves this process."""
     ov = cli_overrides(); out = {}
@@ -1053,7 +1201,8 @@ def connections() -> dict:
         out[k] = {"models": v["models"], "installed": path is not None, "path": path or "", "exe_default": v["exe"],
                   "override": ov.get(k, ""), "isolated": bool(v.get("isolated")), "pkg": v.get("pkg", ""),
                   "state": state, "detail": c.get("detail", ""), "version": VERSIONS.get(k, {}).get("installed", ""),
-                  "latest": VERSIONS.get(k, {}).get("latest", ""), "warnings": env_warnings(k),
+                  "model": c.get("model", ""), "checked": c.get("checked", 0), "default_model": default_model(k),
+                  "latest": VERSIONS.get(k, {}).get("latest", ""), "warnings": env_warnings(k) + shared_codex_warning(k),
                   "can_install": path is None and k != "Codex (latest)", "npm": not npm_missing(), "node_url": NODE_URL,
                   "install_note": "Runs the newest Codex through npx; there is nothing to install beyond Node.js." if k == "Codex (latest)" else install_argv(k)[1],
                   "login_cmd": " ".join(login_argv(k)), "waiting": bool(w and w["until"] > time.time()),
@@ -1203,7 +1352,7 @@ class Session:
         self.created = d.get("created", dt.datetime.now().isoformat(timespec="minutes"))
         self.repo = d.get("repo", DEFAULT_REPO)
         self.room = bool(d.get("room", not d))   # new conversations sit in the room; older saved ones keep their folder
-        self.seats = color_seats(d.get("seats", [dict(x) for x in DEFAULT_SEATS]))
+        self.seats = color_seats(d["seats"] if "seats" in d else default_seats())
         self.topic = d.get("topic", DEFAULT_TOPIC); self.extra = d.get("extra", "")
         self.rounds = d.get("rounds", 3); self.readonly = bool(d.get("readonly", True)) or self.room   # the room is always read-only
         self.mode = d.get("mode", "turns")   # turns | open
@@ -1215,6 +1364,7 @@ class Session:
         self.transcript = d.get("transcript", []); self.turn = d.get("turn", 0)
         self.status = d.get("status", "idle")
         if self.status in ("running", "voting"): self.status = "paused"
+        if self.status == "checking": self.status = "stopped" if self.transcript else "idle"   # Agora quit during a preflight
         self.rounds_done = d.get("rounds_done", 0)
         self.skipped = d.get("skipped", [False] * len(self.seats))
         self.cli_sessions = d.get("cli_sessions", {})       # seat index -> CLI session id (Claude resume)
@@ -1317,8 +1467,9 @@ class Run:
     def __init__(self, session: "Session", agora: "Agora") -> None:
         self.s = session; self.agora = agora
         self.lock = threading.RLock()
-        self.notice = ""                 # why the conversation is paused, when it paused itself
-        self.recovering = False
+        self.notice = ""                 # why the conversation is paused or stopped, when it did that itself
+        self.paused_for = ""             # the provider whose sign-out paused it, so Resume checks only those seats
+        self.preflighting = False
         self.terms: list[dict] = []
         self.current: str | None = None
         self.procs: dict[int, subprocess.Popen] = {}
@@ -1336,33 +1487,90 @@ class Run:
 
 
     def start(self) -> None:
+        """Start, continue, or resume. Before anything is launched every seat is checked with one tiny request through
+        its own CLI, with the model it selected, in the conversation's folder; a seat that fails blocks the start."""
         with self.lock:
             s = self.s
-            if self.busy() or len(s.seats) < 2 or not Path(s.workdir).is_dir(): return
-            if s.status == "paused" and self.thread and self.thread.is_alive():
-                if self.notice:                      # resuming after a Codex sign-out: prove it works before carrying on
-                    if not self.prime_codex(force=True): return
-                    self.notice = ""
+            if self.busy() or self.preflighting or len(s.seats) < 2 or not Path(s.workdir).is_dir(): return
+            resume = s.status == "paused" and self.thread is not None and self.thread.is_alive()
+            if resume and not self.notice:
                 self.pause_flag.clear(); s.status = "running"; s.save(); return
+            if not resume: self.stop_flag.clear()
             one = one_codex(s.seats)
             if one and len(set(codex_seats(s.seats))) > 1:
                 for x in s.seats:
                     if x["provider"] in CODEX_PROVIDERS and x["provider"] != one: x["provider"] = one
                 self._record("Agora", f"Every Codex seat now runs through {one}. One conversation uses one Codex install, "
                                       "because two of them share the same rotating login token.", "system")
-            self.notice = ""
-            if s.status == "done": s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(s.seats))
-            if s.status in ("done", "stopped"): s.skipped = [False] * len(s.seats)   # benched seats get another chance on Continue
-            for f in (self.stop_flag, self.pause_flag, self.vote_flag): f.clear()
-            if not s.title: s.title = " ".join(s.topic.split()[:8])
-            s.status = "running"; s.started_at = time.time(); s.save()
-            for i in range(len(s.seats)): s.seat_dir(i)   # memory files exist before anyone speaks
             if any(PROVIDERS[x["provider"]]["exe"] in ("codex", "npx") for x in s.seats):
                 note = ensure_codex_trust(s.workdir)
                 if note: self._record("Agora", note, "system")
+            for i in range(len(s.seats)): s.seat_dir(i)   # memory files exist before anyone speaks
             if not self.terms: self._reset_terms()
-        self.prime_codex()
-        self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+            self.preflighting = True; self.agora.start_error = ""
+            prev = s.status; s.status = "checking"; s.save()
+        threading.Thread(target=self._check_then_go, args=(resume, prev), daemon=True).start()
+
+
+    def _check_then_go(self, resume: bool, prev: str) -> None:
+        try:
+            problems = self.preflight(only=self.paused_for if resume else "")
+            with self.lock:
+                s = self.s
+                if problems:
+                    s.status = prev; s.save()
+                    self.agora.start_error = "Not started. " + " ".join(problems)
+                    return
+                if resume:
+                    self.notice = ""; self.paused_for = ""; self.pause_flag.clear(); s.status = "running"; s.save(); return
+                self.notice = ""; self.paused_for = ""
+                if prev == "done": s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(s.seats))
+                if prev in ("done", "stopped"): s.skipped = [False] * len(s.seats)   # benched seats get another chance on Continue
+                for f in (self.stop_flag, self.pause_flag, self.vote_flag): f.clear()
+                if not s.title: s.title = " ".join(s.topic.split()[:8])
+                s.status = "running"; s.started_at = time.time(); s.save()
+            self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+        finally:
+            with self.lock: self.preflighting = False
+
+
+    def preflight(self, only: str = "") -> list[str]:
+        """One tiny request per distinct (CLI, model) among the seats, built by the same launcher as a real turn, in the
+        same folder, with the same environment. Seats on a CLI that must start one at a time take turns; the rest run
+        at once. Returns one line per problem; an empty list means every seat answered."""
+        s = self.s; pairs: dict[tuple[str, str], list[int]] = {}
+        for i, seat in enumerate(s.seats):
+            if only and seat["provider"] != only: continue
+            pairs.setdefault((seat["provider"], seat["model"]), []).append(i)
+        results: dict[tuple[str, str], Turn] = {}
+
+        def probe(prov: str, model: str, i: int) -> None:
+            if self.stop_flag.is_set(): return
+            self._term(i, f"[checking {prov} with {model}]")
+            with provider_gate(prov):
+                t = probe_model(prov, model, s.workdir, str(s.seat_dir(i)), s.readonly or s.room,
+                                on_line=lambda ln: self._term(i, ln), procs=self.procs, key=f"check{i}")
+            results[(prov, model)] = t
+            self._term(i, "[answered]" if t.ok else f"[failed: {t.error}]")
+
+        threads = [threading.Thread(target=probe, args=(p, m, idx[0]), daemon=True) for (p, m), idx in pairs.items()]
+        for th in threads: th.start()
+        for th in threads: th.join()
+        problems = []
+        for (p, m), idx in pairs.items():
+            t = results.get((p, m))
+            if t and t.ok: continue
+            names = ", ".join(s.label(s.seats[i]) for i in idx)
+            if t is None: problems.append(f"{names} ({p}, {m}): not checked, the conversation was stopped."); continue
+            why = t.error
+            if t.kind == "auth":
+                why += " " + sign_in_hint(p); threading.Thread(target=check_conn, args=(p,), daemon=True).start()
+            elif t.kind == "model":
+                alt = default_model(p)
+                why += " Pick another model for this seat" + (f"; {alt} has answered {p}'s probe." if alt and alt != m else ".")
+            elif t.kind == "launcher": why = f"Agora built a request with no credentials, a launcher bug. The exact command: {t.cmd}"
+            problems.append(f"{names} ({p}, {m}): {why}")
+        return problems
 
 
     def pause(self) -> None:
@@ -1371,55 +1579,21 @@ class Run:
 
 
     def prime_codex(self, force: bool = False) -> bool:
-        """Run the priming prompt before any turn or batch that includes Codex seats, and keep a copy of the
-        credentials it leaves behind. Nothing else is running while this happens."""
+        """Before a turn or batch with Codex seats: one priming prompt through Codex alone, with the model the first
+        Codex seat selected, so a single process performs any token refresh. Nothing else Codex is running meanwhile."""
         prov = one_codex(self.s.seats)
         if not prov: return True
-        ok, msg = codex_prime(prov, self.s.workdir, force=force)
-        if not ok: self._term(0, f"[Codex priming failed: {msg}]")
-        return ok
-
-
-    def codex_recover(self) -> None:
-        """A Codex seat was refused as signed out. Pause at once, put the saved credentials back, prime again, and
-        carry on if that worked. If it did not, stay paused and say so plainly."""
-        with self.lock:
-            if self.recovering or self.stop_flag.is_set(): return
-            self.recovering = True
-        try:
-            was_running = self.s.status == "running"
-            self.pause()
-            self._record("Agora", "A Codex seat was refused as signed out. The conversation is paused while Agora puts "
-                                  "the saved Codex credentials back and primes them again.", "system")
-            restored = restore_codex_auth()
-            ok = self.prime_codex(force=True)
-            if ok:
-                self.notice = ""
-                self._record("Agora", "Codex answered again" + (" after its saved credentials were restored" if restored else "") +
-                                      ". The conversation continues.", "system")
-                with self.lock:
-                    if was_running and not self.stop_flag.is_set():
-                        self.pause_flag.clear(); self.s.status = "running"; self.s.save()
-            else:
-                self.notice = "Codex signed out, sign in and press Resume"
-                self._record("Agora", "Codex is signed out and Agora could not sign it back in. Open Settings, Connections, "
-                                      "press Sign in for Codex, then press Resume.", "system")
-                check_conn(one_codex(self.s.seats) or "Codex")
-        finally:
-            with self.lock: self.recovering = False
+        seat = next(x for x in self.s.seats if x["provider"] == prov)
+        t = codex_prime(prov, seat["model"], self.s.workdir, force=force)
+        if t is None or t.ok: return True
+        self._term(0, f"[Codex priming failed, {t.kind}: {t.error}]")
+        return False
 
 
     def _kill_tree(self) -> None:
         """Kill every CLI this run started, all at once, without blocking the caller."""
-        def kill(p: subprocess.Popen) -> None:
-            try:
-                if os.name == "nt": subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=15)
-                else: os.killpg(os.getpgid(p.pid), 9)
-            except Exception:
-                try: p.kill()
-                except Exception: pass
         for p in list(self.procs.values()):
-            if p and p.poll() is None: threading.Thread(target=kill, args=(p,), daemon=True).start()
+            if p and p.poll() is None: threading.Thread(target=kill_tree, args=(p,), daemon=True).start()
 
 
     def stop(self) -> None:
@@ -1503,79 +1677,108 @@ class Run:
         self.current = ", ".join(names) if names else None
 
 
-    def _speak(self, i: int, seat: dict, instruction: str) -> str:
-        s = self.s; who = s.label(seat); prov = PROVIDERS[seat["provider"]]
-        if self.stop_flag.is_set(): return f"[{who} was not asked: the conversation was stopped]"
-        if cli_path(seat["provider"]) is None:
-            self._term(i, f"'{exe_of(seat['provider'])}' was not found. Open Settings > CLIs to connect it.")
-            return f"[{who} returned no answer. '{exe_of(seat['provider'])}' was not found. Open Settings > CLIs to connect it.]"
+    def _speak(self, i: int, seat: dict, instruction: str) -> str | None:
+        """One seat's turn. Returns its speech, or None when it sits this turn out; the reason is then already in the
+        chat as a note from Agora, never as the seat's own words."""
+        s = self.s; who = s.label(seat); prov = seat["provider"]
+        if self.stop_flag.is_set(): return None
+        if cli_path(prov) is None:
+            self._term(i, f"'{exe_of(prov)}' was not found. Open Settings, Connections to connect it.")
+            self._record("Agora", f"{who} sits this turn out: '{exe_of(prov)}' was not found. Open Settings, Connections to connect it.", "system")
+            return None
         n = s.turn + 1
         pfile = s.seat_dir(i) / f"prompt_{n:03d}_{int(time.time() * 1000) % 100000}.md"; pfile.write_text(self._prompt(i, seat, instruction), encoding="utf-8")
-        cmd = self._command(i, seat, pfile)
         with self.lock: self.terms[i]["state"] = "speaking"; self.speaking.add(i); self._set_current()
         self._term(i, "=" * 60 + f"\n{who}: turn {n}\n" + "=" * 60)
-        speech = None; stdout_lines: list[str] = []; err_tail: list[str] = []
-        for attempt in (1, 2):
-            speech, stdout_lines, err_tail = self._launch(i, seat, prov, cmd)
-            if speech or self.stop_flag.is_set() or attempt == 2: break
-            if looks_like_auth_error("\n".join(err_tail + stdout_lines[-20:])):
-                # another CLI may have just rotated the login; the refreshed credentials are on disk a moment later
-                self._term(i, "[login problem; waiting 5 s and trying once more]"); time.sleep(5); continue
-            break
-        with self.lock: self.terms[i]["state"] = "waiting"; self.speaking.discard(i); self._set_current()
-        self._term(i, "\ndone. waiting for the next turn.\n")
-        if speech: return speech
-        with self.lock: tail = [ln for ln in list(self.terms[i]["lines"])[-14:] if ln.strip() and not ln.startswith("=") and ": turn " not in ln and "waiting for the next turn" not in ln]
-        detail = "\n".join(tail[-6:]) or "no output at all; the command may not have started"
-        hint = auth_hint(seat["provider"], "\n".join(err_tail + stdout_lines[-20:]))
-        if hint: detail += "\n" + hint
-        if s.cli_sessions.pop(str(i), None): detail += "\n(dropped this agent's resumable CLI session; it will start fresh next turn)"
-        return f"[{who} returned no answer. Last output from its terminal:]\n{detail}"
+        try:
+            return self._attempts(i, seat, pfile)
+        finally:
+            with self.lock: self.terms[i]["state"] = "waiting"; self.speaking.discard(i); self._set_current()
+            self._term(i, "\ndone. waiting for the next turn.\n")
 
 
-    def _launch(self, i: int, seat: dict, prov: dict, cmd: str) -> tuple[str | None, list[str], list[str]]:
-        """Run the CLI once and collect its speech. Gated providers (Claude Code) start one at a time: the gate is held
-        from launch until the CLI has authenticated and written its first line, so several seats never refresh the same
-        login token at the same moment, which logs all but one of them out."""
-        s = self.s; stdout_lines: list[str] = []; speech: str | None = None; new_sid: str | None = None; err_tail: list[str] = []; rc: int | None = None
-        gate = _GATES[seat["provider"]] if prov.get("gate") else None
+    def _attempts(self, i: int, seat: dict, pfile: Path) -> str | None:
+        """Ask the seat and read the answer by the runner's exit code and error flag before anything else. A refusal is
+        handled by its class: a request with no credentials stops the run (Agora's bug); a sign-out pauses the
+        conversation; a missing model moves the seat to one that answered a probe; 429 and 5xx wait with backoff;
+        anything else is asked once more. A seat that still has no answer sits the turn out, with the runner's words."""
+        s = self.s; who = s.label(seat); prov = seat["provider"]
+        asked = 0; waits = 0; switched = False
+        while not self.stop_flag.is_set():
+            t = self._launch(i, seat, self._command(i, seat, pfile)); asked += 1
+            if t.ok: note_model_ok(prov, seat["model"], t.secs); return t.speech
+            self._term(i, f"[{prov} did not answer ({t.kind}): {t.error}]")
+            if t.kind == "launcher":
+                self._record("Agora", f"Agora stopped this conversation. The request it built for {who} through {prov} carried no credentials, "
+                                      f"which is a bug in Agora's launcher, not a sign-in problem. {prov} said: {t.error}\n"
+                                      f"The exact command that was built:\n{t.cmd}", "system")
+                self.notice = f"Stopped: Agora built a {prov} request with no credentials. The command is in the chat."
+                self.stop(); return None
+            if t.kind == "auth":
+                if asked == 1 and self._auth_retry(i, seat): continue
+                self._record("Agora", f"{who} was refused as signed out by {prov}: {t.error}. The conversation is paused. "
+                                      f"{sign_in_hint(prov)} Then press Resume; Agora checks the seat before carrying on.", "system")
+                with self.lock: self.notice = f"{prov} signed out, sign in and press Resume"; self.paused_for = prov
+                self.pause(); threading.Thread(target=check_conn, args=(prov,), daemon=True).start()
+                return None
+            if t.kind == "model" and not switched:
+                alt = default_model(prov)
+                if alt and alt != seat["model"]:
+                    old = seat["model"]; switched = True
+                    with self.lock: seat["model"] = alt; s.cli_sessions.pop(str(i), None); s.save()
+                    self._record("Agora", f"{who}: {prov} has no access to {old} ({t.error}). The seat now uses {alt}, "
+                                          f"the first model that answered {prov}'s probe.", "system")
+                    continue
+            if t.kind == "rate" and waits < len(RATE_BACKOFF):
+                wait = RATE_BACKOFF[waits]; waits += 1
+                self._term(i, f"[busy or rate limited; waiting {int(wait)} s before asking again]")
+                if self._wait(wait): continue
+                return None
+            if t.kind in ("other", "timeout") and asked < 2:
+                self._term(i, "[asking once more]"); s.cli_sessions.pop(str(i), None); continue
+            self._record("Agora", f"{who} sits this turn out. {prov} said: {t.error}", "system")
+            return None
+        return None
+
+
+    def _auth_retry(self, i: int, seat: dict) -> bool:
+        """One more try after a refusal: Codex is primed again with this seat's model, which reads whatever sign-in is on
+        disk now; Claude waits a moment in case another process has just rotated the login token."""
+        prov = seat["provider"]
+        if prov in CODEX_PROVIDERS:
+            t = codex_prime(prov, seat["model"], self.s.workdir, force=True)
+            if t is not None and not t.ok: self._term(i, f"[Codex priming failed, {t.kind}: {t.error}]")
+            return t is None or t.ok
+        self._term(i, "[login problem; waiting 5 s and trying once more]")
+        return self._wait(5)
+
+
+    def _wait(self, secs: float) -> bool:
+        """Sleep unless the conversation is stopped meanwhile. True when it is still fine to go on."""
+        end = time.time() + secs
+        while time.time() < end:
+            if self.stop_flag.is_set(): return False
+            time.sleep(min(0.5, max(0.0, end - time.time())))
+        return not self.stop_flag.is_set()
+
+
+    def _launch(self, i: int, seat: dict, cmd: str) -> Turn:
+        """Run the CLI once through the one launcher. Gated providers (Claude Code) start one at a time: the gate is
+        held from launch until the CLI has authenticated and written its first line, so several seats never refresh
+        the same login token at the same moment, which logs all but one of them out."""
+        s = self.s; prov = seat["provider"]
+        gate = _GATES[prov] if PROVIDERS[prov].get("gate") else None
         held = bool(gate and gate.acquire(timeout=90))
         def let_go() -> None:
             nonlocal held
             if held: held = False; gate.release()   # type: ignore[union-attr]
         try:
-            proc = subprocess.Popen(cmd, cwd=s.workdir, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    start_new_session=(os.name != "nt"), env=child_env(seat["provider"]))
-            self.procs[i] = proc
-            def pump_err(p: subprocess.Popen) -> None:
-                for raw in p.stderr:  # type: ignore[union-attr]
-                    ln = decode_out(raw).rstrip("\r\n"); err_tail.append(ln); del err_tail[:-8]; self._term(i, ln)
-            threading.Thread(target=pump_err, args=(proc,), daemon=True).start()
-            for raw in proc.stdout:  # type: ignore[union-attr]
-                ln = decode_out(raw).rstrip("\r\n") + "\n"
-                if held and ln.strip(): let_go()
-                stdout_lines.append(ln)
-                if prov["speech"] == "claude_stream":
-                    try:
-                        ev = json.loads(ln)
-                        if ev.get("session_id"): new_sid = ev["session_id"]
-                    except Exception: pass
-                    shown, final = render_claude_event(ln)
-                    if shown: self._term(i, shown)
-                    if final is not None: speech = final
-                else: self._term(i, ln.rstrip("\n"))
-            rc = proc.wait(timeout=TURN_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            self.procs[i].kill(); self._term(i, f"[timed out after {TURN_TIMEOUT}s]")
-        except Exception as exc:  # noqa: BLE001
-            self._term(i, f"[agora error while reading output: {type(exc).__name__}: {exc}]")
+            t = run_turn(prov, cmd, s.workdir, on_line=lambda ln: self._term(i, ln), on_start=let_go, procs=self.procs, key=i)
         finally: let_go()
         with self.lock:
-            if new_sid: s.cli_sessions[str(i)] = new_sid
-        if speech is None and prov["speech"] != "claude_stream": speech = "".join(stdout_lines).strip() or None
-        if speech is None and prov["speech"] == "claude_stream":
-            self._term(i, f"[ended without a final answer: exit code {rc}, {len(stdout_lines)} events]" + ("\n" + "\n".join(err_tail) if err_tail else ""))
-        return speech, stdout_lines, err_tail
+            if t.session_id: s.cli_sessions[str(i)] = t.session_id
+        if t.timed_out: self._term(i, f"[{t.error}]")
+        return t
 
 
     def _run_open(self) -> None:
@@ -1613,16 +1816,17 @@ class Run:
             else: instr = OPEN_OPENING if first else (OPEN_ADDRESSED if kind == "addressed" else OPEN_REPLY)
             text = self._speak(i, seat, instr)
             nonlocal last_speaker
+            if text is None:
+                passed_on[i] = len(s.transcript)
+                if self.notice:                                  # paused for a sign-in: this seat speaks first after Resume
+                    with self.lock: queue[i] = kind
+                    return
+                failures[i] = failures.get(i, 0) + 1
+                if failures[i] >= 2 and not s.skipped[i]:
+                    s.skipped[i] = True; self._record("Agora", f"{s.label(seat)} failed twice in a row and is benched for the rest of this conversation. Fix its CLI or model under Agents; it rejoins on Continue.", "system")
+                return
             if text.strip().upper().rstrip(".") == "PASS" or text.strip().upper().startswith("PASS\n"):
                 passed_on[i] = len(s.transcript); self._term(i, "(passed)")
-                return
-            if text.startswith("[") and seat["provider"] in CODEX_PROVIDERS and codex_signed_out(text):
-                passed_on[i] = len(s.transcript); self.codex_recover(); return
-            if text.startswith("[") and "returned no answer" in text:
-                failures[i] = failures.get(i, 0) + 1; passed_on[i] = len(s.transcript)
-                if failures[i] == 1: self._record("Agora", text, "system")
-                if failures[i] >= 2 and not s.skipped[i]:
-                    s.skipped[i] = True; self._record("Agora", f"{s.label(seat)} failed twice in a row and is benched for the rest of this conversation. Fix its provider or model in Details; it rejoins on Continue.", "system")
                 return
             failures[i] = 0
             self._record(s.label(seat), text, "speech"); spoken[i] += 1; last_speaker = i
@@ -1735,17 +1939,17 @@ class Run:
             with self.lock: self.current = s.label(seat)
             if seat["provider"] in CODEX_PROVIDERS: self.prime_codex()
             text = self._speak(i, seat, instr)
-            if seat["provider"] in CODEX_PROVIDERS and text.startswith("[") and codex_signed_out(text):
-                self.codex_recover()
-                if not self.notice and not self.stop_flag.is_set():
-                    text = self._speak(i, seat, instr)      # the recovery worked: give this seat its turn back
+            if text is None and self.notice and not self.stop_flag.is_set():
+                while self.pause_flag.is_set() and not self.stop_flag.is_set(): time.sleep(0.5)   # paused for a sign-in
+                if not self.stop_flag.is_set() and not self.notice: text = self._speak(i, seat, instr)   # signed in again: the seat gets its turn back
             s.last_seen[str(i)] = len(s.transcript)
-            self._record(s.label(seat), text, "speech")
-            if text.startswith("[") and "returned no answer" in text:
+            if text is None:
                 failures[i] += 1
-                if failures[i] >= 2:
-                    s.skipped[i] = True; self._record("Agora", f"{s.label(seat)} failed twice and is skipped for the rest of this conversation.", "system")
-            else: failures[i] = 0
+                if failures[i] >= 2 and not s.skipped[i]:
+                    s.skipped[i] = True; self._record("Agora", f"{s.label(seat)} failed twice and is benched for the rest of this conversation.", "system")
+                continue
+            failures[i] = 0
+            self._record(s.label(seat), text, "speech")
         if not self.stop_flag.is_set():
             with self.lock: s.status = "voting"; s.save()
             for i in range(len(seats)):
@@ -1753,7 +1957,7 @@ class Run:
                 if self.stop_flag.is_set() or s.skipped[i]: continue
                 with self.lock: self.current = s.label(seat)
                 text = self._speak(i, seat, GAME_VOTE if s.framing == "game" else VOTE); s.last_seen[str(i)] = len(s.transcript)
-                self._record(s.label(seat), text, "system" if (text.startswith("[") and "returned no answer" in text) else "resolution")
+                if text is not None: self._record(s.label(seat), text, "resolution")
         with self.lock:
             self.current = None; s.status = "stopped" if self.stop_flag.is_set() else "done"
             s.rounds_done = sum(1 for e in s.transcript if e["kind"] == "speech") // max(1, len(seats)); s.save(transcript_md=True)
@@ -1771,7 +1975,7 @@ class Agora:
         first = self._open_latest()
         self.sid = first.id; self.runs[first.id] = Run(first, self)
         self.phone_url = ""; self.away_url = ""; self.last_tg = ""; self.start_error = ""
-        refresh_versions(); check_all_conns(); tg_fill_bot()
+        forget_codex_backups(); refresh_versions(); check_all_conns(); tg_fill_bot()
 
     def _open_latest(self) -> Session:
         for meta in list_sessions():
@@ -1853,8 +2057,8 @@ class Agora:
                 r._reset_terms(); s.save(); return
             if name not in TEMPLATES: return
             seats = [dict(x) for x in TEMPLATES[name]]
+            for x in seats: x["model"] = seat_model(x["provider"])   # the first model that answered this CLI's probe
             if name.startswith("Arena"):
-                for x in seats: x["model"] = ARENA_MODEL.get(x["provider"], x["model"])
                 r.s.framing = "game"; r.s.mode = "turns"; r.s.rounds = 6; r.s.topic = ARENA_TOPIC; r.s.referee = "World"
             else:
                 r.s.framing = "council"; r.s.referee = ""
@@ -2088,7 +2292,7 @@ textarea{line-height:1.55}
 .dotc{width:9px;height:9px;border-radius:50%;background:var(--faint);flex-shrink:0}
 .st-on .dotc{background:#34D399}.st-on .stat{color:#34D399}
 .st-checking .dotc,.st-ask .dotc{background:#F5C26B}.st-checking .stat,.st-ask .stat{color:#F5C26B}
-.st-off .dotc,.st-none .dotc,.st-unknown .dotc{background:var(--danger)}.st-off .stat,.st-none .stat,.st-unknown .stat{color:var(--danger)}
+.st-off .dotc,.st-none .dotc,.st-unknown .dotc,.st-fail .dotc{background:var(--danger)}.st-off .stat,.st-none .stat,.st-unknown .stat,.st-fail .stat{color:var(--danger)}
 .crow .det{color:var(--muted);font-size:12.5px;margin-top:6px}
 .crow .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
 .crow pre{margin:10px 0 0;padding:8px 10px;background:#050506;border:1px solid var(--line);border-radius:8px;max-height:190px;overflow:auto;font:11.5px/1.45 ui-monospace,Consolas,monospace;color:var(--mono);white-space:pre-wrap}
@@ -2213,7 +2417,7 @@ function rich(text){let h=esc(text);const hold=[];const keep=x=>{hold.push(x);re
  h=h.replace(/@([A-Za-z][\w-]*)/g,(m,n)=>{const c=seatColor(n);return `<span class="men" style="${c?'--mc:'+esc(c):''}">@${n}</span>`});
  h=h.replace(/\u0000(\d+)\u0000/g,(m,i)=>hold[+i]);
  return h.split(/\n{2,}/).map(pg=>`<p>${pg.replace(/\n/g,'<br>')}</p>`).join('')}
-const STATUS={idle:'Not started',running:'Running',paused:'Paused',voting:'Closing statements',done:'Finished',stopped:'Stopped'};
+const STATUS={idle:'Not started',checking:'Checking every seat with one small request',running:'Running',paused:'Paused',voting:'Closing statements',done:'Finished',stopped:'Stopped'};
 
 /* ---------------------------------------------------------------- sheets: one at a time, X or Escape closes */
 const SHEETS={agentsSheet:'agents',topicSheet:'topic',settings:'settings',tgwiz:'telegram'};
@@ -2234,13 +2438,15 @@ function openFromHash(){const h=(location.hash||'').replace('#','');const id=Obj
 /* ---------------------------------------------------------------- connections */
 function connBtn(t,cls){return `<button class="btn sm ${cls||''}">${t}</button>`}
 function connRow(k,p){
- const st={on:'Connected',checking:'Checking',ask:'Sign-in unknown',off:'Not signed in',none:'Not installed',unknown:'Unclear'}[p.state]||p.state;
+ const st={on:'Connected',checking:'Checking',ask:'Sign-in unknown',off:'Not signed in',none:'Not installed',unknown:'Unclear',fail:'Check failed'}[p.state]||p.state;
  const ver=p.version?esc(p.version):(p.isolated?'through npx':'');
  let acts='';
  if(p.state==='none'){
   acts+=p.can_install?`<button class="btn sm" data-a="install">Install</button>`:'';
   if(!p.npm&&p.can_install&&p.pkg)acts=`<a class="btn sm" href="${esc(p.node_url)}" target="_blank" rel="noopener">Get Node.js first</a>`;
   acts+=`<button class="btn sm" data-a="pathbox">Already installed?</button>`;
+ }else if(p.state==='fail'){
+  acts+=`<button class="btn sm" data-a="check">Check</button>`;
  }else if(p.state!=='on'){
   acts+=`<button class="btn sm" data-a="login">Sign in</button><button class="btn sm" data-a="check">Check</button>`;
  }
@@ -2273,7 +2479,7 @@ async function connAct(k,a,row){const note=t=>$('connState').textContent=t;
  if(a==='install'){note('Installing '+k+'...');const r=await api('/conn/install',{provider:k});if(!r.ok)note(r.error||'It would not start.');else{connSig='';note('')}return}
  if(a==='login'){note('Opening a terminal window...');const r=await api('/conn/login',{provider:k});
   note(r.ok?'A terminal window is open with: '+r.cmd+'. Finish the sign-in there; this row turns green by itself.':(r.error||'It would not open.'));connSig='';return}
- if(a==='check'){note('Checking '+k+'...');const paid=k==='Copilot CLI';await api('/conn/check',{provider:k,paid:paid});connSig='';note('');return}
+ if(a==='check'){note('Checking '+k+': one small request...');await api('/conn/check',{provider:k});connSig='';note('');return}
  if(a==='savepath'){const v=row.querySelector('.pin').value;note('Looking...');await api('/conn/path',{provider:k,path:v});connSig='';note('');return}}
 $('connCheck').onclick=async()=>{$('connState').textContent='Checking every CLI...';await api('/conn/refresh',{});connSig='';setTimeout(()=>$('connState').textContent='',2500)};
 
@@ -2289,7 +2495,7 @@ function seatHtml(s,i,locked){const p=providers[s.provider]||{models:[]};const n
 function renderSeats(seats,locked){$('seats').innerHTML=seats.map((s,i)=>seatHtml(s,i,locked)).join('');$('add').disabled=locked;
  $('seatNote').textContent=locked?'Names are fixed once a conversation has started. Change a model or a stance at any time and it applies on that agent\'s next turn.':'They speak in this order. Give each one a name, a CLI, a model, a colour, and a stance if you want one.';
  document.querySelectorAll('.seat').forEach(d=>{const i=+d.dataset.i;const x=d.querySelector('.x');if(x)x.onclick=async()=>{editing=true;const s=seatsFromDom();s.splice(i,1);renderSeats(s,false);await save();editing=false};
-  d.querySelector('.p').onchange=async e=>{editing=true;const s=seatsFromDom();s[i].model=(providers[e.target.value]||{models:['']}).models[0]||'';renderSeats(s,locked);await save();editing=false};
+  d.querySelector('.p').onchange=async e=>{editing=true;const s=seatsFromDom();const np=providers[e.target.value]||{models:['']};s[i].model=np.default_model||(np.models||[''])[0]||'';renderSeats(s,locked);await save();editing=false};
   d.querySelector('.c').oninput=e=>{d.querySelector('.av').style.setProperty('--c',e.target.value)};d.querySelector('.c').onchange=save;
   d.querySelector('.msel').onchange=async e=>{const c=d.querySelector('.mcustom');c.style.display=e.target.value==='__custom'?'':'none';if(e.target.value==='__custom'){c.focus();return}editing=true;await save();editing=false};
   d.querySelector('.mcustom').onfocus=()=>editing=true;d.querySelector('.mcustom').onblur=()=>{editing=false;save()};
@@ -2320,8 +2526,9 @@ function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1;connSi
  const who=s.current?s.current.split(', '):[];const whoTxt=who.length>2?`<b>${who.length} agents</b>`:`<b>${esc(s.current||'')}</b>`;
  $('statusText').innerHTML=s.current?(paused?`Paused after ${whoTxt} finish${who.length>1?'':'es'}`:`${whoTxt} ${who.length>1?'are':'is'} speaking`):STATUS[s.status]||s.status;
  $('status').classList.toggle('live',busy);
- const label=busy?'Pause':paused?'Resume':(s.status==='done'||s.status==='stopped')?'Continue':'Start';
- $('primary').textContent=label;$('primary').disabled=!s.repo_ok||s.seats.length<2;
+ const checking=s.status==='checking';
+ const label=busy?'Pause':paused?'Resume':(s.status==='done'||s.status==='stopped')?'Continue':checking?'Checking':'Start';
+ $('primary').textContent=label;$('primary').disabled=!s.repo_ok||s.seats.length<2||checking;
  $('primary').title=label==='Continue'?`Continue for ${s.rounds} more rounds`:(label==='Pause'?'Finish the turns in flight, then hold':'');
  $('endBtn').style.display=busy?'':'none';
  $('welStart').textContent=label==='Start'?'Start conversation':label;$('welStart').disabled=$('primary').disabled;
@@ -2440,7 +2647,7 @@ async function save(){const my=++saveSeq;const r=await api('/config',{seats:seat
  if(my===saveSeq)return render(r)}
 let saveTimer=null;['title','repo','topic','extra','rounds','maxMsgs','maxMins'].forEach(id=>{const el=$(id);el.onfocus=()=>editing=true;el.onblur=()=>{editing=false;save()};el.oninput=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(save,800)}});
 $('ro').onchange=save;
-$('add').onclick=async()=>{editing=true;const s=seatsFromDom();const k=Object.keys(providers)[0];s.push({name:'',provider:k,model:(providers[k].models||[''])[0],stance:''});renderSeats(s,false);await save();editing=false};
+$('add').onclick=async()=>{editing=true;const s=seatsFromDom();const k=Object.keys(providers)[0];s.push({name:'',provider:k,model:providers[k].default_model||(providers[k].models||[''])[0],stance:''});renderSeats(s,false);await save();editing=false};
 $('whRoom').onclick=async()=>render(await api('/config',{room:true}));$('whFolder').onclick=async()=>render(await api('/config',{room:false}));
 $('referee').onchange=async()=>render(await api('/config',{referee:$('referee').value}));
 $('modeTurns').onclick=async()=>render(await api('/config',{mode:'turns'}));$('modeOpen').onclick=async()=>render(await api('/config',{mode:'open'}));
@@ -2589,7 +2796,7 @@ def make_handler(agora: Agora, token: str):
              "/template/delete": lambda: delete_user_template(data.get("name", "")),
              "/telegram": agora.send_link,
              "/conn/refresh": lambda: check_all_conns(force=True),
-             "/conn/check": lambda: check_conn(data.get("provider", ""), paid=bool(data.get("paid"))),
+             "/conn/check": lambda: check_conn(data.get("provider", "")),
              "/conn/path": lambda: (set_cli_path(data.get("provider", ""), data.get("path", "")), check_conn(data.get("provider", ""))),
              "/conn/dismiss": lambda: setattr(agora, "start_error", "")}.get(self.path, lambda: None)()
             full = self.path in ("/session/open", "/session/new", "/session/delete", "/template")
