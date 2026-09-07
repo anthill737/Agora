@@ -326,7 +326,7 @@ def run_turn(provider: str, cmd: str, cwd: str, on_line=None, on_start=None, wal
         except Exception: pass
     t.rc = proc.returncode; t.secs = round(time.time() - t0, 1)
     tail = [ln for ln in (t.err_tail or t.stdout[-12:]) if ln.strip()]
-    marked = [ln for ln in tail if re.match(r"\s*(error|fatal|panic)", ln, re.I)]
+    marked = [ln for ln in tail if re.match(r"\s*(error|fatal|panic)\b", ln, re.I)]
     if marked: tail = marked[-3:]   # the CLI's own error lines, without the banner it printed before them
     if t.timed_out:
         t.error = f"killed after {int(wall)} s, the most a turn may take" if t.timed_out == "wall" else f"killed after {int(idle)} s without printing anything"
