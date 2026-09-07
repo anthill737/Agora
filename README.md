@@ -42,7 +42,7 @@ Agents and Topic open as panels over the page. One opens at a time, Escape or th
 
 ## Connections
 
-Every agent is a CLI you would otherwise run yourself, so Agora needs it installed and signed in. Settings, Connections has one row per CLI with its name, the version the binary itself prints, and its state. A row says Connected only after one tiny request has actually been answered: Agora asks each CLI for the single word OK, through the same command builder, folder, and environment a real turn uses, trying the models in its list in order until one answers. The row then shows which model answered, when, and how long it took. That model is the default for new seats on that CLI; nothing is assumed before an answer.
+Every agent is a CLI you would otherwise run yourself, so Agora needs it installed and signed in. Settings, Connections has one row per CLI with its name, the version the binary itself prints, and its state. A row says Connected only after one tiny request has actually been answered: Agora asks each CLI for the single word OK, through the same command builder, folder, and environment a real turn uses, trying the models in its list in order until one answers. The row then shows which model answered, when, and how long it took. That model is the default for new seats on that CLI, except Codex seats, which default to gpt-5.6-luna; nothing else is assumed before an answer.
 
 Before spending that request, each CLI's own status command is asked whether it is signed out at all, which costs nothing:
 
@@ -76,7 +76,7 @@ A turn is read by the runner's exit code and error flag first. Output from a run
 | The CLI said | Class | What Agora does |
 | --- | --- | --- |
 | 401, unauthorized, token expired or revoked, not logged in | sign-in | Asks once more after re-checking the sign-in (Codex is primed again with the seat's own model), then pauses the conversation: "signed out, sign in and press Resume". Resume checks that seat before carrying on. |
-| 404, model not found, no access to the model | model | Moves the seat to the first model that answered that CLI's probe, records that in the chat, and asks again. With nothing probed yet the seat sits the turn out. |
+| 404, model not found, no access to the model | model | Moves the seat to the first model of that CLI that answered a probe, records that in the chat, and asks again. With nothing probed yet, the CLI's list is tried once, in order. A model refused with 404 is never asked again in that conversation. |
 | 429, 5xx, rate limit, overloaded | busy | Waits 20 s, then 60 s, then 180 s, asking again after each. Then the seat sits the turn out. |
 | A request that carried no credentials at all | launcher bug | Stops the conversation and puts the exact command Agora built into the chat. This is Agora's fault, not a sign-in problem, and retrying would only repeat it. |
 | Anything else, including a killed run | other | Asks once more, then the seat sits the turn out. |
@@ -85,7 +85,7 @@ A seat that sits a turn out is noted in the chat by Agora, with the CLI's own wo
 
 Two clocks watch every run. A turn is killed after 30 minutes whatever it is still printing, and after 5 minutes without printing anything. Both are settings at the top of `agora.py`.
 
-**Preflight.** Pressing Start first asks every seat for the word OK with exactly the model it selected, in the conversation's folder, with the same environment a turn gets. Seats that share a CLI which must start one at a time take turns; the rest run at once. If any seat fails, nothing is launched and the line under the header says which seat and why. The same check runs on Resume after a sign-out, for the seats of the CLI that was signed out.
+**Preflight.** Pressing Start first asks every seat for the word OK with exactly the model it selected, in the conversation's folder, with the same environment a turn gets. Seats that share a CLI which must start one at a time take turns; the rest run at once. Each seat is asked once at Start and again only after a model error. A seat whose model is refused does not block the start: it moves to the first model of its CLI that answered, the change is saved on the seat, one note in the chat says so, and the conversation starts. A model refused with 404 is never asked again in that conversation. A sign-in failure, a launcher bug, or a CLI that will not answer at all blocks the start, and the line under the header says which seat and why. Resume carries on without asking anything.
 
 ### What Agora does so the CLIs behave
 
@@ -176,6 +176,10 @@ Everything is stored in `agora_telegram.json` next to the script (the file `agor
 
 ## Codex notes
 
+**Models.** Codex seats offer exactly gpt-6-astra, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.4-mini, and gpt-5.3-codex-spark, and default to gpt-5.6-luna. A saved conversation or template with a seat on a name Agora no longer offers, such as gpt-5.5 or gpt-5.6, moves that seat to gpt-5.6-luna and says so in the chat: at once for a conversation that has started, at the next Start for a draft.
+
+**Reasoning effort.** Every Codex launch passes `-c model_reasoning_effort="low"`, so a seat never inherits the effort in your `~/.codex/config.toml`. There is no per-seat setting.
+
 **Trust.** Codex refuses to run non-interactively in a folder it has not been told to trust. When a Codex seat is present, Agora adds the working folder to `~/.codex/config.toml` as trusted (a backup of the file is saved alongside) and records a note in the chat. Codex is also run with `--skip-git-repo-check` so folders that are not git repositories work.
 
 **Rotating tokens.** Codex refresh tokens rotate: the moment one process refreshes, the token every other process holds is dead. Several Codex seats starting at once therefore race and all but one lose with a 401. Agora avoids the race rather than retrying through it.
@@ -192,7 +196,7 @@ Seats still run fully in parallel. Only the priming prompt runs on its own.
 A few defaults live at the top of `agora.py`:
 
 - `DEFAULT_REPO`: the folder offered when a conversation picks "A folder I choose". New conversations start in the room instead.
-- `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here; the order of the list is the order the probe tries. Any seat can also use a custom model name typed in the UI. A provider with `"gate": True` starts one process at a time.
+- `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here; the order of the list is the order the probe tries, and a `"default"` entry names the model new seats get. `CODEX_MODELS`, `CODEX_DEFAULT`, `OLD_CODEX_MODELS`, and `CODEX_EFFORT` sit just above it. Any seat can also use a custom model name typed in the UI. A provider with `"gate": True` starts one process at a time.
 - `TURN_TIMEOUT`: the most one turn may take, in seconds, whatever it is printing. `IDLE_TIMEOUT`: how long a turn may stay silent. `PROBE_TIMEOUT`: the same for one tiny request. `RATE_BACKOFF`: the waits after a 429 or a 5xx.
 - `FRAMING`, `OPENING`, `REPLY`, `OPEN_*`, `VOTE`: the council prompts.
 - `GAME_FRAMING`, `WORLD_STANCE`, `GAME_OPENING`, `GAME_REPLY`, `GAME_VOTE`: the game prompts.
