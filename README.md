@@ -42,18 +42,20 @@ Agents and Topic open as panels over the page. One opens at a time, Escape or th
 
 ## Connections
 
-Every agent is a CLI you would otherwise run yourself, so Agora needs it installed and signed in. Settings, Connections has one row per CLI with its name, its version, and its state, taken from that CLI's own status command:
+Every agent is a CLI you would otherwise run yourself, so Agora needs it installed and signed in. Settings, Connections has one row per CLI with its name, the version the binary itself prints, and its state. A row says Connected only after one tiny request has actually been answered: Agora asks each CLI for the single word OK, through the same command builder, folder, and environment a real turn uses, trying the models in its list in order until one answers. The row then shows which model answered, when, and how long it took. That model is the default for new seats on that CLI; nothing is assumed before an answer.
 
-| CLI | How Agora asks |
+Before spending that request, each CLI's own status command is asked whether it is signed out at all, which costs nothing:
+
+| CLI | Status command |
 | --- | --- |
 | Claude Code | `claude auth status` |
 | Codex | `codex login status` |
-| Codex (latest) | the same, since the npx seat shares `~/.codex/auth.json` |
+| Codex (latest) | the same, since the npx seat shares `~/.codex/auth.json`, which Agora only reads |
 | OpenCode | `opencode auth list` |
 | Gemini CLI | `gemini auth status`, then the credentials in `~/.gemini` |
-| Copilot CLI | nothing, because it has no status command and keeps its token in the operating system credential store. The row stays amber until you press Check, which asks it one tiny question |
+| Copilot CLI | none exists, and its login sits in the operating system credential store, so only the probe can tell |
 
-Every installed CLI is checked when Agora starts, so the rows are already coloured when you open them. Green is connected, amber is checking or unknown, red says what is wrong.
+Every installed CLI is checked when Agora starts, so the rows are already coloured when you open them. Green is connected, amber is checking, red says what is wrong: not installed, not signed in, or a probe that failed with the CLI's own message. Both Codex rows warn when both installs are present, because they share one sign-in whose token rotates on refresh.
 
 Each row offers only what it needs:
 
@@ -66,6 +68,24 @@ Nothing is offered when a CLI is connected.
 Agora connects a CLI one way only: that CLI's own sign-in. Nothing else is asked for, held, or passed to the CLIs it starts.
 
 Connection state appears in exactly one other place: pressing Start with a seat whose CLI is not connected does not start the conversation and puts a single line under the header naming the CLI, with a link into Connections.
+
+### When a seat does not answer
+
+A turn is read by the runner's exit code and error flag first. Output from a run that failed is never taken as speech, whatever it says. What happens next depends on what the CLI said:
+
+| The CLI said | Class | What Agora does |
+| --- | --- | --- |
+| 401, unauthorized, token expired or revoked, not logged in | sign-in | Asks once more after re-checking the sign-in (Codex is primed again with the seat's own model), then pauses the conversation: "signed out, sign in and press Resume". Resume checks that seat before carrying on. |
+| 404, model not found, no access to the model | model | Moves the seat to the first model that answered that CLI's probe, records that in the chat, and asks again. With nothing probed yet the seat sits the turn out. |
+| 429, 5xx, rate limit, overloaded | busy | Waits 20 s, then 60 s, then 180 s, asking again after each. Then the seat sits the turn out. |
+| A request that carried no credentials at all | launcher bug | Stops the conversation and puts the exact command Agora built into the chat. This is Agora's fault, not a sign-in problem, and retrying would only repeat it. |
+| Anything else, including a killed run | other | Asks once more, then the seat sits the turn out. |
+
+A seat that sits a turn out is noted in the chat by Agora, with the CLI's own words, and never as the seat speaking. A seat that fails two turns in a row is benched for the rest of the conversation and rejoins on Continue.
+
+Two clocks watch every run. A turn is killed after 30 minutes whatever it is still printing, and after 5 minutes without printing anything. Both are settings at the top of `agora.py`.
+
+**Preflight.** Pressing Start first asks every seat for the word OK with exactly the model it selected, in the conversation's folder, with the same environment a turn gets. Seats that share a CLI which must start one at a time take turns; the rest run at once. If any seat fails, nothing is launched and the line under the header says which seat and why. The same check runs on Resume after a sign-out, for the seats of the CLI that was signed out.
 
 ### What Agora does so the CLIs behave
 
@@ -158,12 +178,12 @@ Everything is stored in `agora_telegram.json` next to the script (the file `agor
 
 **Trust.** Codex refuses to run non-interactively in a folder it has not been told to trust. When a Codex seat is present, Agora adds the working folder to `~/.codex/config.toml` as trusted (a backup of the file is saved alongside) and records a note in the chat. Codex is also run with `--skip-git-repo-check` so folders that are not git repositories work.
 
-**Rotating tokens.** Codex refresh tokens rotate: the moment one process refreshes, the token every other process holds is dead. Several Codex seats starting at once therefore race, all but one lose with a 401, and a losing writer can leave `~/.codex/auth.json` half written. Agora avoids the race rather than retrying through it.
+**Rotating tokens.** Codex refresh tokens rotate: the moment one process refreshes, the token every other process holds is dead. Several Codex seats starting at once therefore race and all but one lose with a 401. Agora avoids the race rather than retrying through it.
 
-- Before any turn or open-floor batch that includes Codex seats, one short priming prompt runs through Codex alone, so exactly one process performs the refresh. The credentials it leaves behind are copied to `agora_codex_auth.bak` beside the script.
-- If a Codex seat is refused as signed out anyway, the conversation pauses at once, the copy goes back, the priming prompt runs again, and the conversation resumes by itself if that worked.
-- If it did not work, the conversation stays paused and says so: "Codex signed out, sign in and press Resume", with a link into Connections. Pressing Resume primes again before carrying on.
-- One conversation uses one Codex install. If seats mix the pinned global `codex` with the npx latest, Agora moves them all onto one at Start and records a note, because two programs sharing one rotating token is the same race again.
+- Before any turn or open-floor batch that includes Codex seats, one short priming prompt runs through Codex alone, with the model the first Codex seat selected, so exactly one process performs the refresh.
+- Agora never writes, copies, or restores `~/.codex/auth.json`. It reads the file only to tell whether the npx seat is signed in. Earlier builds kept a copy beside the script; that is gone, and any copy left behind is deleted when Agora starts.
+- If a Codex seat is refused as signed out, Codex is primed once more with that seat's model. If that is refused too, the conversation pauses and says so: "Codex signed out, sign in and press Resume", with a link into Connections. Resume checks the Codex seats before carrying on.
+- One conversation uses one Codex install. If seats mix the pinned global `codex` with the npx latest, Agora moves them all onto one at Start and records a note, because two programs sharing one rotating token is the same race again. Both Connections rows warn about it whenever both installs are present.
 
 Seats still run fully in parallel. Only the priming prompt runs on its own.
 
@@ -172,15 +192,19 @@ Seats still run fully in parallel. Only the priming prompt runs on its own.
 A few defaults live at the top of `agora.py`:
 
 - `DEFAULT_REPO`: the folder offered when a conversation picks "A folder I choose". New conversations start in the room instead.
-- `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here. Any seat can also use a custom model name typed in the UI. A provider with `"gate": True` starts one process at a time.
-- `TURN_TIMEOUT`: how long one agent may take per turn, in seconds.
+- `PROVIDERS`: the CLI command templates and model lists for each provider. Add a provider or model here; the order of the list is the order the probe tries. Any seat can also use a custom model name typed in the UI. A provider with `"gate": True` starts one process at a time.
+- `TURN_TIMEOUT`: the most one turn may take, in seconds, whatever it is printing. `IDLE_TIMEOUT`: how long a turn may stay silent. `PROBE_TIMEOUT`: the same for one tiny request. `RATE_BACKOFF`: the waits after a 429 or a 5xx.
 - `FRAMING`, `OPENING`, `REPLY`, `OPEN_*`, `VOTE`: the council prompts.
 - `GAME_FRAMING`, `WORLD_STANCE`, `GAME_OPENING`, `GAME_REPLY`, `GAME_VOTE`: the game prompts.
 - `TEMPLATES`: the built-in seat layouts.
 
 ## Files not committed
 
-`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, the empty room, the CLIs Agora installs into `agora_tools`, the Codex credential copy, and all saved conversations and run output. Those stay on your machine.
+`.gitignore` excludes the access token, the Telegram config, your saved templates, your CLI paths, the empty room, the CLIs Agora installs into `agora_tools`, and all saved conversations and run output. Those stay on your machine.
+
+## Tests
+
+`python -m unittest test_agora -v` runs the runner tests in about half a minute. A stub CLI stands in for the real ones and fakes each error class, a run that prints nothing, and a run that never stops printing, so the tests cover every class above, both timeouts, preflight, Connections, and the promise that the Codex auth file is never written. No real CLI is called and no request is spent.
 
 ## License
 
