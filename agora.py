@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_REPO = str(Path.home())   # the folder offered when a conversation chooses "A folder I choose"
-BUILD = "2026-09-06.11"
+BUILD = "2026-09-06.12"
 TURN_TIMEOUT = 1800
 HERE = Path(__file__).resolve()
 RUNS = HERE.with_name("agora_runs")
@@ -2023,6 +2023,21 @@ header .title{color:var(--muted);flex:1;white-space:nowrap;overflow:hidden;text-
 .tag{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--s3);color:var(--muted)}
 .msg.convener{--c:#7FD3A0}.msg.convener .who{color:#7FD3A0}
 .msg.system{--c:#E5484D}.msg.system .who{color:var(--danger)}
+/* reading the transcript: round markers, quiet system notes, long speeches folded, a way back to the newest */
+.rnd{display:flex;align-items:center;gap:12px;margin:22px 0 16px;color:var(--faint);font-size:11px;font-weight:600;letter-spacing:.8px;text-transform:uppercase}
+.rnd:before,.rnd:after{content:"";height:1px;background:var(--line);flex:1}
+.rnd.new{color:var(--accent)}.rnd.new:before,.rnd.new:after{background:color-mix(in srgb,var(--accent) 40%,transparent)}
+.sys{margin:0 0 14px;padding:8px 12px;border-left:2px solid var(--danger);background:rgba(229,72,77,.07);border-radius:0 8px 8px 0;color:var(--muted);font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+body.compact .msg{padding:9px 14px;margin-bottom:9px}
+body.compact .msg .body{font-size:13.5px;line-height:1.5}
+body.compact .msg .hd{margin-bottom:3px;font-size:12px}
+body.compact .rnd{margin:14px 0 10px}
+body.compact .sys{padding:6px 10px;margin-bottom:9px}
+.msg.fold .body{max-height:20em;overflow:hidden;mask-image:linear-gradient(#000 72%,transparent);-webkit-mask-image:linear-gradient(#000 72%,transparent)}
+.msg.fold.open .body{max-height:none;mask-image:none;-webkit-mask-image:none}
+.more{margin-top:6px;padding:0;height:auto;border:0;background:transparent;color:var(--accent);font-size:12.5px;cursor:pointer}.more:hover{background:transparent;text-decoration:underline}
+#jump{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);margin-bottom:10px;display:none;align-items:center;gap:8px;background:var(--s3);border:1px solid var(--edge);border-radius:999px;padding:0 14px;height:34px;font-size:12.5px;box-shadow:0 10px 24px rgba(0,0,0,.5);z-index:26}
+#jump.on{display:inline-flex}#jump b{color:var(--accent)}
 .typing{color:var(--muted);font-size:13px;padding:2px 0 14px;display:flex;gap:8px;align-items:center}.typing:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);animation:pulse 1.1s infinite}
 @keyframes pulse{50%{opacity:.2}}
 #composer{border-top:1px solid var(--line);background:var(--s1);padding:12px 0}
@@ -2124,7 +2139,7 @@ textarea{line-height:1.55}
     <div class="row"><button id="welAgents" class="btn">Agents</button><button id="welTopic" class="btn">Topic</button><button id="welStart" class="primary">Start conversation</button></div>
     <div class="note" id="welSum"></div></div></div>
   <div id="msgs"></div><div class="typing" id="typing" style="display:none"></div></div></section>
- <div id="composer"><div class="inner"><div id="ac" role="listbox"></div><div class="tawrap"><div id="hl" aria-hidden="true"></div><textarea id="sayText" rows="1" aria-label="Message the agents"></textarea></div><select id="sayTo" title="Who must answer first" aria-label="Who must answer first"><option value="">Everyone</option></select><button id="sayBtn" class="primary">Send</button></div></div>
+ <div id="composer"><div class="inner"><button id="jump">Jump to the newest <b id="jumpN"></b></button><div id="ac" role="listbox"></div><div class="tawrap"><div id="hl" aria-hidden="true"></div><textarea id="sayText" rows="1" aria-label="Message the agents"></textarea></div><select id="sayTo" title="Who must answer first" aria-label="Who must answer first"><option value="">Everyone</option></select><button id="sayBtn" class="primary">Send</button></div></div>
 </main>
 
 <aside id="terms"><div class="grip" id="termGrip" title="Drag to resize"></div><div class="empty">Each agent's live terminal appears here after you press Start.</div></aside>
@@ -2168,6 +2183,7 @@ textarea{line-height:1.55}
   <div class="note" id="tgInfo" style="margin-top:6px"></div></section>
  <section class="sg"><h2>Display</h2>
   <div class="kv"><span>Text size</span><span class="row"><button class="btn sm" id="fsDown">Smaller</button><button class="btn sm" id="fsUp">Larger</button></span></div>
+  <div class="kv"><span>Spacing</span><span class="row"><button class="btn sm" id="dRoomy">Roomy</button><button class="btn sm" id="dTight">Tight</button></span></div>
   <div class="kv" id="termRow"><span>Terminals</span><button class="btn sm" id="termBtn">Show or hide</button></div>
   <div class="kv"><span>Panel sizes</span><button class="btn sm" id="layoutReset">Reset to defaults</button></div></section>
  <section class="sg"><h2>Agora</h2>
@@ -2354,15 +2370,60 @@ function render(s){const first=!S||S.id!==s.id;if(first){T=[];lastTurn=-1;connSi
   if(first||seatsLocked!==started||JSON.stringify(seatsFromDom())!==JSON.stringify(s.seats.map(x=>({name:x.name,provider:x.provider,model:x.model,stance:x.stance,color:x.color})))){renderSeats(s.seats,started);seatsLocked=started}}
  renderConns(s);if($('settings').classList.contains('open'))renderTg(s);
  renderHist(s);
- if(!mobile()){document.body.classList.toggle('autoterm',!(started||busy))}
+ const anyOutput=(s.terms||[]).some(t=>t.count>0);
+ if(!mobile())document.body.classList.toggle('autoterm',!(busy||anyOutput));
  $('chatEmpty').style.display=s.transcript.length?'none':'block';
- const chatEl=$('chat');
- const msgHtml=e=>`<div class="msg ${e.kind}" style="${e.color?'--c:'+esc(e.color):''}"><div class="hd"><span class="av">${esc((e.speaker||'?')[0])}</span><span class="who">${esc(e.speaker)}</span>${e.kind==='resolution'?'<span class="tag">closing statement</span>':''}<span class="meta">turn ${e.turn} · ${e.time}</span></div><div class="body">${rich(e.text)}</div></div>`;
- const have=$('msgs').children.length;
- if(first||have>s.transcript.length){$('msgs').innerHTML=s.transcript.map(msgHtml).join('');chatEl.scrollTop=chatEl.scrollHeight}
- else if(have<s.transcript.length){const atB=chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight<120;$('msgs').insertAdjacentHTML('beforeend',s.transcript.slice(have).map(msgHtml).join(''));if(atB)chatEl.scrollTop=chatEl.scrollHeight}
+ if(first){divider=seenTurn(s.id);nWhileAway=0}
+ rounds=(s.mode!=='open'&&s.seats.length>1)?s.seats.length:0;
+ const wasAtBottom=first||atBottom();
+ const shown=[...$('msgs').children].filter(x=>x.classList.contains('msg')||x.classList.contains('sys')).length;
+ if(first||shown>s.transcript.length){$('msgs').innerHTML=msgsHtml(s.transcript,0,null);toBottom(true)}
+ else if(shown<s.transcript.length){
+  const done=s.transcript.slice(0,shown);
+  $('msgs').insertAdjacentHTML('beforeend',msgsHtml(s.transcript.slice(shown),done.filter(e=>e.kind==='speech').length,done[done.length-1]));
+  if(wasAtBottom)toBottom();else{nWhileAway+=s.transcript.length-shown;showJump()}}
+ if(wasAtBottom)markSeen(s);
  $('typing').style.display=s.current?'flex':'none';$('typing').textContent=s.current?(who.length>3?who.length+' agents':s.current)+(paused?' finishing, then the conversation pauses':(who.length>1?' are writing':' is writing')):'';
  renderTerms(s)}
+
+/* ---------------------------------------------------------------- reading the transcript */
+const FOLD=1500;                 // a speech longer than this is folded until you ask for the rest
+let rounds=0,divider=0,nWhileAway=0;
+function seenStore(){try{return JSON.parse(localStorage.getItem('agora-seen')||'{}')}catch(e){return {}}}
+function seenTurn(id){return +(seenStore()[id]||0)}
+function markSeen(s){if(!s.transcript.length)return;const st=seenStore();const last=s.transcript[s.transcript.length-1].turn;
+ if(st[s.id]===last)return;st[s.id]=last;try{localStorage.setItem('agora-seen',JSON.stringify(st))}catch(e){}}
+function msgHtml(e){
+ if(e.kind==='system')return `<div class="sys">${esc(e.text)}</div>`;
+ const fold=(e.kind==='speech'||e.kind==='resolution')&&e.text.length>FOLD;
+ return `<div class="msg ${e.kind}${fold?' fold':''}" style="${e.color?'--c:'+esc(e.color):''}"><div class="hd"><span class="av">${esc((e.speaker||'?')[0])}</span><span class="who">${esc(e.speaker)}</span>${e.kind==='resolution'?'<span class="tag">closing statement</span>':''}<span class="meta">turn ${e.turn} · ${e.time}</span></div><div class="body">${rich(e.text)}</div>${fold?'<button class="more">Show the rest</button>':''}</div>`}
+const secs=t=>{const m=/^(\d+):(\d+):(\d+)/.exec(t||'');return m?(+m[1]*3600+ +m[2]*60+ +m[3]):null};
+function gapLine(prev,e){                       // an open floor has no rounds, so time is the thing that orients you
+ const a=secs(prev&&prev.time),b=secs(e.time);
+ if(a===null||b===null)return '';
+ const d=b-a;
+ if(d<120||d>86400)return '';
+ const txt=d<3600?`${Math.round(d/60)} minutes later`:(d<7200?'an hour later':`${Math.round(d/3600)} hours later`);
+ return `<div class="rnd">${txt}</div>`}
+function msgsHtml(list,spokenBefore,prev){let n=spokenBefore;const out=[];
+ for(const e of list){
+  if(divider&&e.turn===divider+1&&n>0)out.push('<div class="rnd new">New since you were last here</div>');
+  else if(prev)out.push(gapLine(prev,e));
+  if(e.kind==='speech'){
+   if(rounds&&n>0&&n%rounds===0)out.push(`<div class="rnd">Round ${Math.floor(n/rounds)+1}</div>`);
+   n++}
+  out.push(msgHtml(e));prev=e}
+ return out.join('')}
+function atBottom(){const c=$('chat');return c.scrollHeight-c.scrollTop-c.clientHeight<80}
+function toBottom(hard){const c=$('chat');const go=()=>{c.scrollTop=c.scrollHeight};go();requestAnimationFrame(go);
+ if(hard){setTimeout(go,60);setTimeout(go,300)}nWhileAway=0;showJump()}
+function showJump(){const on=!atBottom()&&$('msgs').children.length>0;$('jump').classList.toggle('on',on);
+ $('jumpN').textContent=nWhileAway?`(${nWhileAway} new)`:''}
+$('jump').onclick=()=>{divider=0;toBottom(true)};
+$('chat').addEventListener('scroll',()=>{if(atBottom()){nWhileAway=0;if(S)markSeen(S)}showJump()},{passive:true});
+$('msgs').addEventListener('click',e=>{const b=e.target.closest('.more');if(!b)return;
+ const m=b.closest('.msg');m.classList.toggle('open');b.textContent=m.classList.contains('open')?'Show less':'Show the rest'});
+try{history.scrollRestoration='manual'}catch(e){}   // the browser must not put us back where we were last time
 
 /* ---------------------------------------------------------------- header and gear actions */
 $('agentsBtn').onclick=()=>openSheet('agentsSheet');$('topicBtn').onclick=()=>openSheet('topicSheet');
@@ -2470,9 +2531,13 @@ function bindGrips(){const g1=$('railGrip'),g2=$('termGrip');
  if(g1&&!g1.dataset.b){g1.dataset.b=1;g1.onpointerdown=e=>drag(e,g1,x=>{LAY.rail=Math.min(480,Math.max(180,x));applyLayout()})}
  if(g2&&!g2.dataset.b){g2.dataset.b=1;g2.onpointerdown=e=>drag(e,g2,x=>{LAY.terms=Math.min(window.innerWidth*0.7,Math.max(280,window.innerWidth-x));applyLayout()})}}
 function drag(e,el,fn){e.preventDefault();el.classList.add('drag');el.setPointerCapture(e.pointerId);const mv=ev=>fn(ev.clientX);const up=()=>{el.classList.remove('drag');window.removeEventListener('pointermove',mv);window.removeEventListener('pointerup',up);saveLayout()};window.addEventListener('pointermove',mv);window.addEventListener('pointerup',up)}
+function applyDensity(){const tight=LAY.compact===1;document.body.classList.toggle('compact',tight);
+ $('dRoomy').classList.toggle('on',!tight);$('dTight').classList.toggle('on',tight)}
+$('dRoomy').onclick=()=>{LAY.compact=0;applyDensity();saveLayout()};
+$('dTight').onclick=()=>{LAY.compact=1;applyDensity();saveLayout()};
 $('fsUp').onclick=()=>{LAY.fs=Math.min(20,(LAY.fs||14)+1);applyLayout();saveLayout()};$('fsDown').onclick=()=>{LAY.fs=Math.max(11,(LAY.fs||14)-1);applyLayout();saveLayout()};
-$('layoutReset').onclick=()=>{for(const k of Object.keys(LAY))delete LAY[k];localStorage.removeItem('agora-layout');const r=document.documentElement.style;['--rail','--terms','--fs','--tfs'].forEach(v=>r.removeProperty(v))};
-applyLayout();bindGrips();openFromHash();
+$('layoutReset').onclick=()=>{for(const k of Object.keys(LAY))delete LAY[k];localStorage.removeItem('agora-layout');const r=document.documentElement.style;['--rail','--terms','--fs','--tfs'].forEach(v=>r.removeProperty(v));applyDensity()};
+applyLayout();applyDensity();bindGrips();openFromHash();
 function wantTerms(){const noterm=document.body.classList.contains('noterm')||document.body.classList.contains('autoterm');return mobile()?$('terms').classList.contains('on'):!noterm}
 (async function poll(){try{render(await api('/state?since='+(S?lastTurn:-1)+'&terms='+(wantTerms()?1:0)))}catch(e){}setTimeout(poll,1500)})();
 </script></body></html>"""
